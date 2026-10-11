@@ -57,26 +57,28 @@ export function SettingsPage() {
   const budget = tpmManager.getBudget();
 
   return (
-    <div className="h-full overflow-y-auto p-6">
+    <div className="h-full overflow-y-auto p-6 bg-gray-950/30">
       <div className="max-w-3xl mx-auto space-y-8">
         <div>
-          <h2 className="text-2xl font-bold text-white mb-2">Settings</h2>
+          <h2 className="text-2xl font-bold text-white mb-2 tracking-tight">Settings</h2>
           <p className="text-gray-400 text-sm">Configure AI providers, models, and application behavior.</p>
         </div>
 
         {/* API Keys */}
-        <section className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <Key className="w-5 h-5 text-blue-400" />
-            <h3 className="text-lg font-semibold text-white">API Keys</h3>
+        <section className="card p-6">
+          <div className="flex items-center gap-2.5 mb-4">
+            <span className="w-8 h-8 rounded-lg bg-blue-500/10 ring-1 ring-inset ring-blue-500/20 flex items-center justify-center">
+              <Key className="w-4 h-4 text-blue-400" />
+            </span>
+            <h3 className="section-title !text-base">API Keys</h3>
             <Shield className="w-4 h-4 text-green-400 ml-auto" />
-            <span className="text-xs text-green-400">Stored locally, never shared</span>
+            <span className="badge bg-green-500/10 text-green-400 ring-green-500/20">Stored locally, never shared</span>
           </div>
 
           <div className="space-y-4">
             {/* Groq */}
             <div>
-              <label className="text-sm text-gray-400 mb-1 block">Groq API Key</label>
+              <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">Groq API Key</label>
               <div className="flex gap-2">
                 <div className="flex-1 relative">
                   <input
@@ -84,11 +86,12 @@ export function SettingsPage() {
                     value={settings.groqApiKey || ''}
                     onChange={e => updateSettings({ groqApiKey: e.target.value })}
                     placeholder="gsk_..."
-                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                    className="input w-full"
                   />
                   <button
                     onClick={() => setShowGroqKey(!showGroqKey)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                    aria-label="Toggle key visibility"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-gray-500 hover:text-gray-300 hover:bg-white/[0.06]"
                   >
                     {showGroqKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
@@ -96,7 +99,7 @@ export function SettingsPage() {
                 <button
                   onClick={() => handleTestConnection('groq')}
                   disabled={testingProvider === 'groq'}
-                  className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 transition-colors disabled:opacity-50"
+                  className="btn-secondary !px-4"
                 >
                   {testingProvider === 'groq' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}
                 </button>
@@ -111,7 +114,7 @@ export function SettingsPage() {
 
             {/* OpenRouter */}
             <div>
-              <label className="text-sm text-gray-400 mb-1 block">OpenRouter API Key</label>
+              <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">OpenRouter API Key</label>
               <div className="flex gap-2">
                 <div className="flex-1 relative">
                   <input
@@ -119,11 +122,12 @@ export function SettingsPage() {
                     value={settings.openRouterApiKey || ''}
                     onChange={e => updateSettings({ openRouterApiKey: e.target.value })}
                     placeholder="sk-or-..."
-                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                    className="input w-full"
                   />
                   <button
                     onClick={() => setShowOpenRouterKey(!showOpenRouterKey)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                    aria-label="Toggle key visibility"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-md text-gray-500 hover:text-gray-300 hover:bg-white/[0.06]"
                   >
                     {showOpenRouterKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                   </button>
@@ -131,7 +135,7 @@ export function SettingsPage() {
                 <button
                   onClick={() => handleTestConnection('openrouter')}
                   disabled={testingProvider === 'openrouter'}
-                  className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 transition-colors disabled:opacity-50"
+                  className="btn-secondary !px-4"
                 >
                   {testingProvider === 'openrouter' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}
                 </button>
@@ -147,10 +151,12 @@ export function SettingsPage() {
         </section>
 
         {/* Model Configuration */}
-        <section className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <Zap className="w-5 h-5 text-purple-400" />
-            <h3 className="text-lg font-semibold text-white">Model Configuration</h3>
+        <section className="card p-6">
+          <div className="flex items-center gap-2.5 mb-4">
+            <span className="w-8 h-8 rounded-lg bg-purple-500/10 ring-1 ring-inset ring-purple-500/20 flex items-center justify-center">
+              <Zap className="w-4 h-4 text-purple-400" />
+            </span>
+            <h3 className="section-title !text-base">Model Configuration</h3>
           </div>
 
           <div className="space-y-4">
@@ -183,92 +189,96 @@ export function SettingsPage() {
         </section>
 
         {/* Token Budget */}
-        <section className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <Zap className="w-5 h-5 text-yellow-400" />
-            <h3 className="text-lg font-semibold text-white">Token Budget (TPM)</h3>
+        <section className="card p-6">
+          <div className="flex items-center gap-2.5 mb-4">
+            <span className="w-8 h-8 rounded-lg bg-yellow-500/10 ring-1 ring-inset ring-yellow-500/20 flex items-center justify-center">
+              <Zap className="w-4 h-4 text-yellow-400" />
+            </span>
+            <h3 className="section-title !text-base">Token Budget (TPM)</h3>
           </div>
 
           <div className="space-y-4">
             <div>
-              <label className="text-sm text-gray-400 mb-1 block">Global TPM Limit</label>
+              <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">Global TPM Limit</label>
               <input
                 type="number"
                 value={settings.globalTpmLimit}
                 onChange={e => updateSettings({ globalTpmLimit: parseInt(e.target.value) || 100000 })}
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                className="input w-full tabular-nums"
               />
             </div>
 
             <div>
-              <label className="text-sm text-gray-400 mb-1 block">Max Tokens per Request</label>
+              <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">Max Tokens per Request</label>
               <input
                 type="number"
                 value={settings.maxTokensPerRequest}
                 onChange={e => updateSettings({ maxTokensPerRequest: parseInt(e.target.value) || 4096 })}
-                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                className="input w-full tabular-nums"
               />
             </div>
 
             {/* Current usage */}
-            <div className="bg-gray-800/50 rounded-lg p-3">
-              <div className="text-xs text-gray-500 mb-2">Current Window Usage</div>
-              <div className="flex items-center gap-3">
-                <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-blue-500 to-purple-500 rounded-full transition-all"
-                    style={{ width: `${Math.min(100, (budget.usedInWindow / budget.globalLimit) * 100)}%` }}
-                  />
-                </div>
-                <span className="text-xs text-gray-400">
+            <div className="panel p-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] uppercase tracking-wider text-gray-500">Current Window Usage</span>
+                <span className="text-xs text-gray-400 tabular-nums">
                   {budget.usedInWindow.toLocaleString()} / {budget.globalLimit.toLocaleString()}
                 </span>
+              </div>
+              <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-500"
+                  style={{ width: `${Math.min(100, (budget.usedInWindow / budget.globalLimit) * 100)}%` }}
+                />
               </div>
             </div>
           </div>
         </section>
 
         {/* Advanced Settings */}
-        <section className="bg-gray-900 rounded-xl border border-gray-800 p-6">
+        <section className="card p-6">
           <button
             onClick={() => setAdvanced(!advanced)}
             className="flex items-center gap-2 w-full"
           >
-            <AlertTriangle className="w-5 h-5 text-orange-400" />
-            <h3 className="text-lg font-semibold text-white">Advanced Settings</h3>
-            <span className="ml-auto text-xs text-gray-500">{advanced ? 'Hide' : 'Show'}</span>
+            <span className="w-8 h-8 rounded-lg bg-orange-500/10 ring-1 ring-inset ring-orange-500/20 flex items-center justify-center">
+              <AlertTriangle className="w-4 h-4 text-orange-400" />
+            </span>
+            <h3 className="section-title !text-base">Advanced Settings</h3>
+            <span className="ml-auto badge bg-white/[0.04] text-gray-500 ring-white/10">{advanced ? 'Hide' : 'Show'}</span>
           </button>
 
           {advanced && (
             <div className="mt-4 space-y-4">
               <div>
-                <label className="text-sm text-gray-400 mb-1 block">Max Tool Steps per Request</label>
+                <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">Max Tool Steps per Request</label>
                 <input
                   type="number"
                   value={settings.maxToolSteps}
                   onChange={e => updateSettings({ maxToolSteps: parseInt(e.target.value) || 20 })}
                   min={1}
                   max={50}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  className="input w-full tabular-nums"
                 />
               </div>
 
               <div>
-                <label className="text-sm text-gray-400 mb-1 block">Max Call Duration (ms)</label>
+                <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">Max Call Duration (ms)</label>
                 <input
                   type="number"
                   value={settings.maxCallDuration}
                   onChange={e => updateSettings({ maxCallDuration: parseInt(e.target.value) || 120000 })}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  className="input w-full tabular-nums"
                 />
               </div>
 
               <div>
-                <label className="text-sm text-gray-400 mb-1 block">Theme</label>
+                <label className="block text-xs font-medium uppercase tracking-wider text-gray-500 mb-1.5">Theme</label>
                 <select
                   value={settings.theme}
                   onChange={e => updateSettings({ theme: e.target.value as any })}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+                  className="input w-full tabular-nums"
                 >
                   <option value="dark">Dark</option>
                   <option value="light">Light</option>
@@ -280,22 +290,21 @@ export function SettingsPage() {
         </section>
 
         {/* Data Management */}
-        <section className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <div className="flex items-center gap-2 mb-4">
-            <Trash2 className="w-5 h-5 text-red-400" />
-            <h3 className="text-lg font-semibold text-white">Data Management</h3>
+        <section className="card p-6">
+          <div className="flex items-center gap-2.5 mb-4">
+            <span className="w-8 h-8 rounded-lg bg-red-500/10 ring-1 ring-inset ring-red-500/20 flex items-center justify-center">
+              <Trash2 className="w-4 h-4 text-red-400" />
+            </span>
+            <h3 className="section-title !text-base">Data Management</h3>
           </div>
           <p className="text-sm text-gray-400 mb-3">
             Clear all local data including chat history, workflows, and logs.
           </p>
           <button
             onClick={handleClearData}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              confirmClear
-                ? 'bg-red-600 hover:bg-red-700 text-white'
-                : 'bg-gray-800 hover:bg-red-900/30 text-red-400 border border-red-800/30'
-            }`}
+            className={confirmClear ? 'btn-danger' : 'btn-secondary !border-red-500/30 !text-red-400 hover:!bg-red-500/10 hover:!border-red-500/50 hover:!text-red-300'}
           >
+            <Trash2 className="w-4 h-4" />
             {confirmClear ? 'Click again to confirm deletion' : 'Clear All Data'}
           </button>
         </section>
@@ -320,7 +329,7 @@ function ModelSelector({ label, config, onChange, models, optional }: {
           <label className="text-sm text-gray-400">{label}</label>
           <button
             onClick={() => { setEnabled(true); onChange({ provider: 'groq', modelId: 'llama-3.3-70b-versatile' }); }}
-            className="text-xs text-blue-400 hover:text-blue-300"
+            className="text-xs font-medium text-blue-400 hover:text-blue-300 px-1.5 py-0.5 rounded-md hover:bg-blue-500/10"
           >
             + Add
           </button>
