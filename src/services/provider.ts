@@ -7,6 +7,7 @@ export interface ProviderMessage {
   content: string;
   tool_calls?: any[];
   tool_call_id?: string;
+  name?: string;
 }
 
 export interface StreamCallbacks {
@@ -61,8 +62,19 @@ function getApiKey(settings: AppSettings, provider: string): string | undefined 
 }
 
 function estimateTokens(messages: ProviderMessage[]): number {
-  // Rough estimation: ~4 chars per token
-  const totalChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+  // Rough estimation: ~4 chars per token. Tool-call payloads must be counted
+  // too — they are part of the prompt but were previously ignored entirely,
+  // which made the TPM reservation systematically underestimate real usage.
+  let totalChars = 0;
+  for (const m of messages) {
+    totalChars += m.content?.length || 0;
+    if (m.tool_calls) {
+      try {
+        totalChars += JSON.stringify(m.tool_calls).length;
+      } catch { /* ignore unserializable payloads */ }
+    }
+    if (m.name) totalChars += m.name.length;
+  }
   return Math.ceil(totalChars / 4);
 }
 
@@ -88,14 +100,18 @@ export async function callProvider(
       continue;
     }
 
+    let reservationId: string | null = null;
     try {
-      // Reserve tokens in TPM budget
+      // Reserve tokens in TPM budget. `reserve` returns a reservation id so we
+      // can release/confirm exactly THIS reservation later — previously the id
+      // was discarded and error paths released an arbitrary (oldest) provider
+      // reservation, which could free a concurrent request's pending budget.
       const estimatedTokens = estimateTokens(messages);
       const maxOutput = settings.maxTokensPerRequest;
       const totalEstimated = estimatedTokens + maxOutput;
-      
-      const reserved = await tpmManager.reserve(config.provider, totalEstimated, settings);
-      if (!reserved) {
+
+      reservationId = await tpmManager.reserve(config.provider, totalEstimated, settings);
+      if (!reservationId) {
         lastError = new Error('Token budget exhausted. Please wait or increase limits.');
         continue;
       }
@@ -104,14 +120,20 @@ export async function callProvider(
         config, apiKey, messages, tools, callbacks, abortSignal, settings
       );
 
-      // Update TPM with actual usage
-      tpmManager.recordUsage(config.provider, result.usage.totalTokens);
-      await recordTokenUsage(result.usage);
+      // Update TPM with actual usage AND release this request's reservation in
+      // one step. Previously the reservation was never released on success, so
+      // its tokens were double-counted (reserved + used) until the 30s expiry.
+      tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
+      reservationId = null;
+      await recordTokenUsage({ ...result.usage, provider: config.provider, model: config.modelId });
 
       return { ...result, model: config.modelId, provider: config.provider };
     } catch (err: any) {
-      tpmManager.releaseReservation(config.provider);
-      
+      // Release our own reservation on any failure path (no-op if already done)
+      if (reservationId) {
+        tpmManager.releaseReservation(config.provider, reservationId);
+        reservationId = null;
+      }
       if (err.name === 'AbortError') throw err;
       
       lastError = err;
@@ -231,42 +253,69 @@ async function handleStreamingResponse(
   let fullContent = '';
   let promptTokens = 0;
   let completionTokens = 0;
+  // SSE frames must be reassembled across network-chunk boundaries: a single
+  // `data:` line can be split over two chunks (and one chunk can contain many
+  // lines). Previously every partial line was fed to JSON.parse and silently
+  // dropped, which randomly lost tokens/tool-calls whenever the TCP framing
+  // didn't align with SSE line breaks.
+  let buffer = '';
+  let sawDone = false;
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.replace(/\r$/, '');
+    if (!line.startsWith('data:')) return;
+    const rest = line.slice(5);
+    const data = rest.startsWith(' ') ? rest.slice(1) : rest;
+    if (data === '[DONE]') {
+      sawDone = true;
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(data);
+      const delta = parsed.choices?.[0]?.delta;
+
+      if (delta?.content) {
+        fullContent += delta.content;
+        callbacks.onToken(delta.content);
+      }
+
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          callbacks.onToolCall(tc);
+        }
+      }
+
+      if (parsed.usage) {
+        promptTokens = parsed.usage.prompt_tokens;
+        completionTokens = parsed.usage.completion_tokens;
+      }
+    } catch {
+      // Skip malformed events
+    }
+  };
 
   try {
-    while (true) {
+    while (!sawDone) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+      buffer += decoder.decode(value, { stream: true });
 
-      for (const line of lines) {
-        const data = line.slice(6);
-        if (data === '[DONE]') break;
-
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta;
-          
-          if (delta?.content) {
-            fullContent += delta.content;
-            callbacks.onToken(delta.content);
-          }
-          
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              callbacks.onToolCall(tc);
-            }
-          }
-
-          if (parsed.usage) {
-            promptTokens = parsed.usage.prompt_tokens;
-            completionTokens = parsed.usage.completion_tokens;
-          }
-        } catch {
-          // Skip malformed chunks
-        }
+      // Keep the last (possibly incomplete) segment in the buffer until the
+      // terminating newline of the next chunk arrives.
+      const lines2 = buffer.split('\n');
+      buffer = lines2.pop() ?? '';
+      for (const line of lines2) {
+        processLine(line);
+        if (sawDone) break;
       }
+    }
+
+    // Flush any trailing complete event left in the buffer at stream end.
+    if (!sawDone && buffer) {
+      processLine(buffer);
+      buffer = '';
     }
   } catch (err: any) {
     if (err.name === 'AbortError') {

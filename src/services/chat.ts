@@ -28,6 +28,8 @@ export class ChatOrchestrator {
   private toolCallCount = 0;
   private maxToolSteps = 20;
   private processedToolCalls = new Set<string>();
+  /** Content streamed during the current turn (kept for abort persistence). */
+  private partialContent = '';
 
   async sendMessage(
     settings: AppSettings,
@@ -40,19 +42,30 @@ export class ChatOrchestrator {
     this.processedToolCalls = new Set();
     this.maxToolSteps = settings.maxToolSteps;
 
-    // Add user message
-    const userMsg: ChatMessage = {
+    // Add user message (via immutable helper so React state updates and the
+    // final persistence below always see the same, up-to-date session)
+    this.appendMessage(session, {
       id: crypto.randomUUID(),
       role: 'user',
       content: userMessage,
       timestamp: Date.now(),
-    };
-    session.messages.push(userMsg);
+    });
 
     try {
       await this.runAgentLoop(settings, session, callbacks);
     } catch (err: any) {
       if (err.name === 'AbortError') {
+        // Persist what was streamed so far — previously an abort discarded the
+        // entire partial answer and even the user message from the session.
+        if (this.partialContent.trim().length > 0) {
+          this.appendMessage(session, {
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: this.partialContent + '\n\n*(Antwort abgebrochen)*',
+            timestamp: Date.now(),
+          });
+        }
+        await saveChatSession(session);
         callbacks.onStatus('Aborted by user');
         return;
       }
@@ -61,6 +74,20 @@ export class ChatOrchestrator {
     }
 
     await saveChatSession(session);
+  }
+
+  /**
+   * Append a message immutably: replaces `session.messages` with a new array
+   * and `session.updatedAt` with a fresh timestamp. A plain `push()` mutated
+   * the object that is also held in React state, so `UPDATE_SESSION` produced
+   * a reference-equal messages array — the user message never re-rendered
+   * until the stream finished and could even be rendered twice once the UI
+   * callback spread `[...currentSession.messages, message]` from a stale
+   * closure.
+   */
+  private appendMessage(session: ChatSession, message: ChatMessage): void {
+    session.messages = [...session.messages, message];
+    session.updatedAt = Date.now();
   }
 
   private async runAgentLoop(
@@ -75,6 +102,14 @@ export class ChatOrchestrator {
     let currentProvider = '';
     let totalTokens = 0;
     const sources: Source[] = [];
+    // Track streamed content on the instance so an abort in sendMessage can
+    // persist the partial answer instead of discarding it.
+    this.partialContent = '';
+    // Per-turn counter for synthesizing unique tool-call ids when the model
+    // omits `tc.id`: a bare `call_${this.toolCallCount}` stayed at 0 whenever
+    // ids were missing, so `processedToolCalls` swallowed every call after the
+    // first one and their results never reached the model (broken protocol).
+    let turnCallIndex = 0;
     // Deduplicate tool calls by (name + arguments): models often repeat the
     // exact same call across steps, which wastes both execution time and
     // prompt tokens for the duplicated results.
@@ -95,6 +130,7 @@ export class ChatOrchestrator {
           {
             onToken: (token: string) => {
               assistantContent += token;
+              this.partialContent += token;
               callbacks.onToken(token);
             },
             onToolCall: (tc: any) => {
@@ -131,30 +167,39 @@ export class ChatOrchestrator {
           tokensUsed: totalTokens,
           sources: sources.length > 0 ? sources : undefined,
         };
-        session.messages.push(finalMessage);
+        this.appendMessage(session, finalMessage);
         callbacks.onComplete(finalMessage);
         callbacks.onStatus('Complete');
         return;
       }
 
-      // Process tool calls
+      // Process tool calls. Assign a stable unique id to every call FIRST and
+      // reuse it in both the assistant message and the matching tool result —
+      // previously the two could diverge (`call_${idx}` vs `call_${count}`),
+      // breaking the tool-call protocol for models that omit `tc.id`.
+      const resolvedToolCalls = toolCalls.map((tc, idx) => ({
+        raw: tc,
+        id: tc.id || `call_${step}_${turnCallIndex + idx}`,
+      }));
+
       const assistantMsg: ProviderMessage = {
         role: 'assistant',
         content: assistantContent || '',
-        tool_calls: toolCalls.map((tc, idx) => ({
-          id: tc.id || `call_${idx}`,
+        tool_calls: resolvedToolCalls.map(({ raw, id }) => ({
+          id,
           type: 'function',
           function: {
-            name: tc.function?.name || tc.name || '',
-            arguments: tc.function?.arguments || tc.arguments || '{}',
+            name: raw.function?.name || raw.name || '',
+            arguments: raw.function?.arguments || raw.arguments || '{}',
           },
         })),
       };
       messages.push(assistantMsg);
 
       // Execute each tool call
-      for (const tc of toolCalls) {
-        const callId = tc.id || `call_${this.toolCallCount}`;
+      for (const { raw: tc, id: preallocatedId } of resolvedToolCalls) {
+        const callId = preallocatedId;
+        turnCallIndex++;
         
         // Prevent duplicate execution
         if (this.processedToolCalls.has(callId)) continue;
@@ -241,7 +286,7 @@ export class ChatOrchestrator {
       tokensUsed: totalTokens,
       sources: sources.length > 0 ? sources : undefined,
     };
-    session.messages.push(finalMessage);
+    this.appendMessage(session, finalMessage);
     callbacks.onComplete(finalMessage);
     callbacks.onStatus('Max steps reached');
   }
