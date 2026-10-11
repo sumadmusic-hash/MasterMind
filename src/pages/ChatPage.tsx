@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, memo } from 'react';
 import { useApp } from '../store/AppContext';
 import { chatOrchestrator } from '../services/chat';
 import { saveChatSession, deleteChatSession } from '../services/database';
@@ -108,11 +108,12 @@ export function ChatPage() {
     }
   };
 
-  const copyToClipboard = (text: string, id: string) => {
+  // Stabilized so memoized MessageBubble only re-renders when `copiedId` changes.
+  const copyToClipboard = useCallback((text: string, id: string) => {
     navigator.clipboard.writeText(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
-  };
+  }, []);
 
   const handleSend = async () => {
     if (!input.trim() || streaming) return;
@@ -419,7 +420,11 @@ export function ChatPage() {
   );
 }
 
-function MessageBubble({ message, copiedId, onCopy }: {
+// Memoized: during streaming, ChatPage re-renders on EVERY token. Without
+// memo, all historical message bubbles would re-render each time (O(n) work
+// per token). `onCopy` is stabilized via useCallback in the parent, so only
+// the actively changing bubble(s) re-render.
+const MessageBubble = memo(function MessageBubble({ message, copiedId, onCopy }: {
   message: ChatMessage;
   copiedId: string | null;
   onCopy: (text: string, id: string) => void;
@@ -490,7 +495,7 @@ function MessageBubble({ message, copiedId, onCopy }: {
       </div>
     </div>
   );
-}
+});
 
 function ToolProgress({ calls, results }: { calls: ToolCall[]; results: ToolResult[] }) {
   const [expanded, setExpanded] = useState(false);

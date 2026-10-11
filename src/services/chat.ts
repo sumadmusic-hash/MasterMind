@@ -196,18 +196,23 @@ export class ChatOrchestrator {
       };
       messages.push(assistantMsg);
 
-      // Execute each tool call
+      // Prepare all tool calls first (validation, dedup, protocol bookkeeping),
+      // then execute them in PARALLEL — network-bound tools (search, news,
+      // stock, URL fetch) previously ran one after another, so a step with
+      // several calls took the SUM of their latencies instead of the maximum.
+      const pendingCalls: ToolCall[] = [];
+
       for (const { raw: tc, id: preallocatedId } of resolvedToolCalls) {
         const callId = preallocatedId;
         turnCallIndex++;
-        
+
         // Prevent duplicate execution
         if (this.processedToolCalls.has(callId)) continue;
         this.processedToolCalls.add(callId);
 
         const toolName = tc.function?.name || tc.name || '';
         let toolArgs: Record<string, any> = {};
-        
+
         try {
           const argsStr = tc.function?.arguments || tc.arguments || '{}';
           toolArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr;
@@ -237,38 +242,53 @@ export class ChatOrchestrator {
         seenToolSignatures.add(signature);
 
         callbacks.onToolCall(toolCall);
-        callbacks.onStatus(`Running: ${toolName}...`);
+        pendingCalls.push(toolCall);
+      }
 
-        const result = await toolRegistry.execute(toolCall);
-        callbacks.onToolResult(result);
+      if (pendingCalls.length > 0) {
+        callbacks.onStatus(
+          pendingCalls.length === 1
+            ? `Running: ${pendingCalls[0].toolName}...`
+            : `Running ${pendingCalls.length} tools in parallel...`
+        );
 
-        // Extract sources from tool results
-        if (result.success && result.data) {
-          if (result.data.results) {
-            for (const r of result.data.results) {
-              if (r.url && r.title) {
-                sources.push({ title: r.title, url: r.url, snippet: r.snippet });
+        const results = await Promise.all(pendingCalls.map(c => toolRegistry.execute(c)));
+
+        // Push results in the ORIGINAL call order so the assistant tool_calls
+        // and tool messages stay aligned in the conversation protocol.
+        for (let i = 0; i < pendingCalls.length; i++) {
+          const toolCall = pendingCalls[i];
+          const result = results[i];
+          callbacks.onToolResult(result);
+
+          // Extract sources from tool results
+          if (result.success && result.data) {
+            if (result.data.results) {
+              for (const r of result.data.results) {
+                if (r.url && r.title) {
+                  sources.push({ title: r.title, url: r.url, snippet: r.snippet });
+                }
+              }
+            }
+            if (result.data.articles) {
+              for (const a of result.data.articles) {
+                if (a.url && a.title) {
+                  sources.push({ title: a.title, url: a.url, snippet: a.snippet, publishedAt: a.publishedAt });
+                }
               }
             }
           }
-          if (result.data.articles) {
-            for (const a of result.data.articles) {
-              if (a.url && a.title) {
-                sources.push({ title: a.title, url: a.url, snippet: a.snippet, publishedAt: a.publishedAt });
-              }
-            }
-          }
+
+          // Add tool result to messages (compacted: raw results would otherwise
+          // be re-sent as prompt tokens on every remaining agent step)
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify(result.success ? compactToolData(result.data) : { error: result.error }),
+            tool_call_id: toolCall.id,
+          });
+
+          this.toolCallCount++;
         }
-
-        // Add tool result to messages (compacted: raw results would otherwise
-        // be re-sent as prompt tokens on every remaining agent step)
-        messages.push({
-          role: 'tool',
-          content: JSON.stringify(result.success ? compactToolData(result.data) : { error: result.error }),
-          tool_call_id: callId,
-        });
-
-        this.toolCallCount++;
       }
 
       // Reset content for next iteration
