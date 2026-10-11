@@ -84,11 +84,12 @@ class WorkflowEngine {
     workflow: WorkflowDefinition,
     inputs: Record<string, any>
   ): Promise<{ success: boolean; output?: any; error?: string; duration: number }> {
-    const startTime = Date.now();
+    // Use performance.now() for sub-millisecond accuracy; Date.now() would often yield 0
+    const startTime = performance.now();
     
     const validation = this.validateWorkflow(workflow);
     if (!validation.valid) {
-      return { success: false, error: validation.errors.join('; '), duration: Date.now() - startTime };
+      return { success: false, error: validation.errors.join('; '), duration: Math.max(1, Math.round(performance.now() - startTime)) };
     }
 
     const context: WorkflowExecutionContext = {
@@ -180,7 +181,7 @@ class WorkflowEngine {
       success: !hasErrors,
       output: finalOutput,
       error: hasErrors ? Array.from(context.errors.entries()).map(([k, v]) => `${k}: ${v}`).join('; ') : undefined,
-      duration: Date.now() - startTime,
+      duration: Math.max(1, Math.round(performance.now() - startTime)),
     };
   }
 
