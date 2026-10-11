@@ -26,6 +26,8 @@ class TokenPerMinuteManager {
 
   configure(settings: AppSettings): void {
     this.budget.globalLimit = settings.globalTpmLimit;
+    // Reset per-provider limits to reflect current settings (remove stale entries)
+    this.budget.perProvider = {};
     if (settings.perProviderLimits) {
       for (const [provider, limit] of Object.entries(settings.perProviderLimits)) {
         this.budget.perProvider[provider] = { used: 0, limit };
@@ -70,10 +72,14 @@ class TokenPerMinuteManager {
       return false;
     }
     
-    // Check per-provider limit
+    // Check per-provider limit (include pending reservations for this provider)
     const providerLimit = this.budget.perProvider[provider];
     if (providerLimit) {
-      const providerTotal = providerLimit.used + tokens;
+      let reservedForProvider = 0;
+      for (const res of this.reservations.values()) {
+        if (res.provider === provider) reservedForProvider += res.tokens;
+      }
+      const providerTotal = providerLimit.used + reservedForProvider + tokens;
       if (providerTotal > providerLimit.limit) {
         return false;
       }
