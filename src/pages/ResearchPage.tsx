@@ -23,45 +23,45 @@ export function ResearchPage() {
     try {
       const newResults: ResearchResult[] = [];
 
-      // Search for news
-      const newsResult = await toolRegistry.execute({
-        id: `research_news_${Date.now()}`,
-        toolId: 'news_search',
-        toolName: 'News Search',
-        arguments: { query, maxResults: 10, hoursBack: 48 },
-        timestamp: Date.now(),
-      });
+      // News, web search and company lookup are independent — run them in
+      // PARALLEL. Previously they awaited one after another, so a research run
+      // took the sum of all API latencies instead of roughly the slowest one.
+      const [newsResult, searchResult, companyResult] = await Promise.all([
+        toolRegistry.execute({
+          id: `research_news_${Date.now()}`,
+          toolId: 'news_search',
+          toolName: 'News Search',
+          arguments: { query, maxResults: 10, hoursBack: 48 },
+          timestamp: Date.now(),
+        }),
+        toolRegistry.execute({
+          id: `research_search_${Date.now()}`,
+          toolId: 'web_search',
+          toolName: 'Web Search',
+          arguments: { query, maxResults: 8 },
+          timestamp: Date.now(),
+        }),
+        toolRegistry.execute({
+          id: `research_company_${Date.now()}`,
+          toolId: 'company_lookup',
+          toolName: 'Company Lookup',
+          arguments: { companyName: query },
+          timestamp: Date.now(),
+        }),
+      ]);
 
       if (newsResult.success && newsResult.data?.articles?.length > 0) {
         newResults.push({ type: 'news', data: newsResult.data, timestamp: Date.now() });
       }
 
-      // Search for web results
-      const searchResult = await toolRegistry.execute({
-        id: `research_search_${Date.now()}`,
-        toolId: 'web_search',
-        toolName: 'Web Search',
-        arguments: { query, maxResults: 8 },
-        timestamp: Date.now(),
-      });
-
       if (searchResult.success && searchResult.data?.results?.length > 0) {
         newResults.push({ type: 'search', data: searchResult.data, timestamp: Date.now() });
       }
 
-      // Try company lookup
-      const companyResult = await toolRegistry.execute({
-        id: `research_company_${Date.now()}`,
-        toolId: 'company_lookup',
-        toolName: 'Company Lookup',
-        arguments: { companyName: query },
-        timestamp: Date.now(),
-      });
-
       if (companyResult.success && companyResult.data?.found) {
         newResults.push({ type: 'company', data: companyResult.data, timestamp: Date.now() });
 
-        // If company found, also get stock data
+        // Stock data depends on the resolved ticker, so it runs afterwards
         const stockResult = await toolRegistry.execute({
           id: `research_stock_${Date.now()}`,
           toolId: 'stock_price',
