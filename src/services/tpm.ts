@@ -93,14 +93,17 @@ class TokenPerMinuteManager {
 
   private cleanWindow(): void {
     const now = Date.now();
-    const windowStart = now - this.windowMs;
-    
+    // Sliding-window cutoff: keep every usage entry younger than 60s. NOTE:
+    // the cutoff must NOT be written into budget.windowStart — that field is
+    // display metadata for a fixed window and would otherwise jump forward on
+    // every call (windowStart > timestamps of retained entries).
+    const cutoff = now - this.windowMs;
+
     // Clean old usage entries
-    this.usageLog = this.usageLog.filter(u => u.timestamp >= windowStart);
-    
+    this.usageLog = this.usageLog.filter(u => u.timestamp >= cutoff);
+
     // Recalculate
     this.budget.usedInWindow = this.usageLog.reduce((sum, u) => sum + u.tokens, 0);
-    this.budget.windowStart = windowStart;
     
     // Clean expired reservations (older than 30 seconds)
     for (const [id, res] of this.reservations) {

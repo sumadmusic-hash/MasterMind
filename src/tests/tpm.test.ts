@@ -25,12 +25,14 @@ describe('TokenPerMinuteManager', () => {
 
   it('should allow reservation within budget', async () => {
     const result = await tpmManager.reserve('groq', 1000, mockSettings);
-    expect(result).toBe(true);
+    // reserve() returns a truthy reservation id on success
+    expect(result).toBeTruthy();
   });
 
   it('should reject reservation exceeding budget', async () => {
     const result = await tpmManager.reserve('groq', 200000, mockSettings);
-    expect(result).toBe(false);
+    // reserve() returns null when the budget would be exceeded
+    expect(result).toBeNull();
   });
 
   it('should track remaining budget', async () => {
@@ -62,11 +64,11 @@ describe('TokenPerMinuteManager', () => {
 
     // Should succeed within provider limit
     const result1 = await tpmManager.reserve('groq', 3000, settingsWithProviderLimit);
-    expect(result1).toBe(true);
+    expect(result1).toBeTruthy();
 
     // Should fail exceeding provider limit
     const result2 = await tpmManager.reserve('groq', 3000, settingsWithProviderLimit);
-    expect(result2).toBe(false);
+    expect(result2).toBeNull();
   });
 
   it('should release reservations', async () => {
