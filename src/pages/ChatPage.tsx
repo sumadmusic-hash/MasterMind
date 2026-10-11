@@ -121,21 +121,33 @@ export function ChatPage() {
       return;
     }
 
-    let currentSession = session;
-    if (!currentSession) {
-      currentSession = {
-        id: crypto.randomUUID(),
-        title: input.substring(0, 50),
-        messages: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
+    // Work on a local session object and mirror every mutation into the store
+    // via UPDATE_SESSION. Previously `currentSession` was captured once from
+    // state; because the orchestrator mutated the same object, onComplete
+    // spread `[...currentSession.messages, message]` — which already contained
+    // the just-pushed final message — so the assistant reply (and with a stale
+    // closure even the whole history) was rendered/stored twice.
+    let currentSession: ChatSession = session
+      ? { ...session, messages: [...session.messages] }
+      : {
+          id: crypto.randomUUID(),
+          title: input.substring(0, 50),
+          messages: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+    if (!session) {
       dispatch({ type: 'SET_ACTIVE_SESSION', payload: currentSession });
       dispatch({
         type: 'SET_CHAT_SESSIONS',
         payload: [currentSession, ...state.chatSessions],
       });
     }
+
+    const syncSession = (s: ChatSession) => {
+      currentSession = s;
+      dispatch({ type: 'UPDATE_SESSION', payload: s });
+    };
 
     setStreaming(true);
     setStreamContent('');
@@ -163,19 +175,29 @@ export function ChatPage() {
             setToolResults(prev => [...prev, result]);
           },
           onComplete: (message) => {
-            const updated = {
-              ...currentSession!,
-              messages: [...currentSession!.messages, message],
+            // The orchestrator already appended `message` to the session
+            // object it works on; only the user message might have been added
+            // there after our last snapshot, so sync from the live object and
+            // never append the final message manually again.
+            const updated: ChatSession = {
+              ...currentSession,
+              messages: [...currentSession.messages],
               updatedAt: Date.now(),
-              title: currentSession!.messages.length === 0 ? userInput.substring(0, 50) : currentSession!.title,
+              title: message.role === 'assistant' &&
+                currentSession.messages.filter(m => m.role === 'user').length <= 1 &&
+                currentSession.title === 'New Chat'
+                ? userInput.substring(0, 50)
+                : currentSession.title,
             };
-            dispatch({ type: 'UPDATE_SESSION', payload: updated });
+            syncSession(updated);
             setStreaming(false);
             setStreamContent('');
             setStatus('');
           },
           onError: (err) => {
             setError(err);
+            // Persist the partial turn (user message etc.) so it survives reload
+            syncSession({ ...currentSession, messages: [...currentSession.messages] });
             setStreaming(false);
             setStreamContent('');
             setStatus('');
@@ -185,6 +207,11 @@ export function ChatPage() {
           },
         }
       );
+      // Safety net: ensure the final session state (incl. any content saved by
+      // the orchestrator on abort) is reflected in the UI even if onComplete
+      // never fired.
+      syncSession({ ...currentSession, messages: [...currentSession.messages] });
+      setStreaming(false);
     } catch (err: any) {
       setError(err.message);
       setStreaming(false);
@@ -194,8 +221,10 @@ export function ChatPage() {
 
   const handleAbort = () => {
     chatOrchestrator.abort();
-    setStreaming(false);
-    setStatus('Aborted');
+    // Don't clear streamContent here: the orchestrator persists the partial
+    // answer asynchronously; clearing immediately would race with onComplete /
+    // the final sync and could briefly drop visible content.
+    setStatus('Aborting...');
   };
 
   return (
