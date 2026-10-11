@@ -106,17 +106,34 @@ export function ResearchPage() {
                 onChange={e => setQuery(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleResearch()}
                 placeholder="Enter a topic, company, or ticker to research..."
+                aria-label="Research-Thema"
                 className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-10 pr-4 py-2.5 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
               />
             </div>
             <button
               onClick={handleResearch}
               disabled={loading || !query.trim()}
-              className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 text-white rounded-lg text-sm font-medium transition-colors"
+              title="Research starten (Enter)"
+              className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
             >
-              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Research'}
+              {loading ? <><Loader2 className="w-4 h-4 animate-spin" /> Researching...</> : 'Research'}
             </button>
           </div>
+
+          {/* Quick suggestions */}
+          {!query && (
+            <div className="flex flex-wrap gap-1.5 mt-3">
+              {['NVIDIA', 'Tesla', 'AI industry', 'renewable energy', 'AAPL'].map(s => (
+                <button
+                  key={s}
+                  onClick={() => setQuery(s)}
+                  className="px-2.5 py-1 text-xs text-gray-400 bg-gray-800/60 hover:bg-gray-800 hover:text-gray-200 rounded-full border border-gray-700/50 transition-colors"
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
 
           {/* Tabs */}
           <div className="flex gap-1 mt-3">

@@ -18,6 +18,7 @@ export function ChatPage() {
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [toolResults, setToolResults] = useState<ToolResult[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -26,6 +27,40 @@ export function ChatPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [session?.messages, streamContent]);
+
+  // Auto-resizing textarea for comfortable multi-line input
+  const autoResize = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, []);
+
+  useEffect(() => {
+    autoResize();
+  }, [input, autoResize]);
+
+  // Focus input when chat page opens / session changes
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, [session?.id]);
+
+  // Escape aborts streaming, Ctrl+K focuses the input
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && streaming) {
+        e.preventDefault();
+        handleAbort();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        inputRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streaming]);
 
   const createNewSession = useCallback(() => {
     const newSession: ChatSession = {
@@ -63,6 +98,20 @@ export function ChatPage() {
     if (session?.id === id) {
       dispatch({ type: 'SET_ACTIVE_SESSION', payload: null });
     }
+    setConfirmDeleteId(null);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const copyToClipboard = (text: string, id: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(null), 2000);
   };
 
   const handleSend = async () => {
@@ -149,19 +198,6 @@ export function ChatPage() {
     setStatus('Aborted');
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
-  };
-
   return (
     <div className="h-full flex">
       {/* Session List */}
@@ -185,12 +221,33 @@ export function ChatPage() {
               onClick={() => selectSession(s)}
             >
               <span className="flex-1 truncate">{s.title || 'Untitled'}</span>
-              <button
-                onClick={(e) => { e.stopPropagation(); handleDeleteSession(s.id); }}
-                className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-400 transition-opacity"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
+              {confirmDeleteId === s.id ? (
+                <span className="flex items-center gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>
+                  <button
+                    onClick={() => handleDeleteSession(s.id)}
+                    className="px-1.5 py-0.5 bg-red-600 hover:bg-red-700 text-white text-xs rounded transition-colors"
+                    title="Wirklich löschen?"
+                  >
+                    Löschen?
+                  </button>
+                  <button
+                    onClick={() => setConfirmDeleteId(null)}
+                    className="px-1.5 py-0.5 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs rounded transition-colors"
+                    title="Abbrechen"
+                  >
+                    ✕
+                  </button>
+                </span>
+              ) : (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(s.id); }}
+                  className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-400 transition-all"
+                  title="Chat löschen"
+                  aria-label="Chat löschen"
+                >
+                  <Trash2 className="w-3 h-3" />
+                </button>
+              )}
             </div>
           ))}
           {state.chatSessions.length === 0 && (
@@ -293,8 +350,9 @@ export function ChatPage() {
                 value={input}
                 onChange={e => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Ask me to research something..."
-                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-100 placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50"
+                placeholder="Ask me to research something...  (Enter = senden, Shift+Enter = neue Zeile)"
+                title="Enter zum Senden, Shift+Enter für neue Zeile"
+                className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-100 placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/50 max-h-[200px] overflow-y-auto"
                 rows={1}
                 disabled={streaming}
               />
@@ -302,6 +360,8 @@ export function ChatPage() {
             {streaming ? (
               <button
                 onClick={handleAbort}
+                title="Antwort abbrechen (Esc)"
+                aria-label="Antwort abbrechen"
                 className="px-4 py-3 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-colors"
               >
                 <Square className="w-4 h-4" />
@@ -310,11 +370,19 @@ export function ChatPage() {
               <button
                 onClick={handleSend}
                 disabled={!input.trim()}
+                title="Senden (Enter)"
+                aria-label="Senden"
                 className="px-4 py-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded-xl transition-colors"
               >
                 <Send className="w-4 h-4" />
               </button>
             )}
+          </div>
+          <div className="max-w-4xl mx-auto mt-1.5 flex items-center justify-between text-[11px] text-gray-600 px-1">
+            <span>
+              Strg+K: Fokus · Esc: Abbrechen · Alt+1–5: Seiten wechseln
+            </span>
+            <span>{input.length > 0 && `${input.length} Zeichen`}</span>
           </div>
         </div>
       </div>
@@ -355,6 +423,8 @@ function MessageBubble({ message, copiedId, onCopy }: {
           <button
             onClick={() => onCopy(message.content, message.id)}
             className="p-1 hover:text-gray-400 text-gray-600 transition-colors"
+            title={copiedId === message.id ? 'Kopiert!' : 'Text kopieren'}
+            aria-label="Nachricht kopieren"
           >
             {copiedId === message.id ? <Check className="w-3 h-3 text-green-400" /> : <Copy className="w-3 h-3" />}
           </button>
