@@ -1,9 +1,9 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { toolRegistry } from '../services/tools';
 import type { ToolDefinition } from '../types';
 import {
   Wrench, Search, Newspaper, Building2, TrendingUp, Filter,
-  FileText, Globe, ToggleLeft, ToggleRight, TestTube, ChevronDown, ChevronUp
+  FileText, Globe, ToggleLeft, ToggleRight, TestTube, ChevronDown, ChevronUp, X
 } from 'lucide-react';
 
 const CATEGORY_ICONS: Record<string, any> = {
@@ -33,6 +33,7 @@ export function ToolsPage() {
   const [testResult, setTestResult] = useState<any>(null);
   const [testing, setTesting] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   const filteredTools = tools.filter(t =>
     t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -50,6 +51,27 @@ export function ToolsPage() {
   const handleToggle = (toolId: string, enabled: boolean) => {
     toolRegistry.toggleTool(toolId, enabled);
     setTools(toolRegistry.getAllTools());
+  };
+
+  // Prefill the test input with a valid example derived from the tool's schema
+  const selectToolForTesting = (tool: ToolDefinition) => {
+    setSelectedTool(tool.id);
+    setTestResult(null);
+    const example: Record<string, any> = {};
+    const props = (tool.inputSchema as any)?.properties || {};
+    for (const [key, schema] of Object.entries(props)) {
+      const s = schema as any;
+      if (s.type === 'string') example[key] = key.toLowerCase().includes('ticker') ? 'AAPL' : 'test';
+      else if (s.type === 'number' || s.type === 'integer') example[key] = 5;
+      else if (s.type === 'boolean') example[key] = true;
+      else if (s.type === 'array') example[key] = [];
+    }
+    setTestInput(JSON.stringify(example, null, 2));
+  };
+
+  const clearSearch = () => {
+    setSearchQuery('');
+    searchInputRef.current?.focus();
   };
 
   const handleTest = async (tool: ToolDefinition) => {
@@ -91,12 +113,25 @@ export function ToolsPage() {
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
             <input
+              ref={searchInputRef}
               type="text"
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
-              placeholder="Search tools..."
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+              placeholder="Search tools... (Esc = leeren)"
+              onKeyDown={e => { if (e.key === 'Escape') clearSearch(); }}
+              aria-label="Tools durchsuchen"
+              className="w-full bg-gray-800 border border-gray-700 rounded-lg pl-9 pr-8 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
             />
+            {searchQuery && (
+              <button
+                onClick={clearSearch}
+                title="Suche zurücksetzen"
+                aria-label="Suche zurücksetzen"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
         <div className="flex-1 overflow-y-auto p-3 space-y-4">
@@ -114,7 +149,8 @@ export function ToolsPage() {
                   {categoryTools.map(tool => (
                     <button
                       key={tool.id}
-                      onClick={() => setSelectedTool(tool.id)}
+                      onClick={() => selectToolForTesting(tool)}
+                      title={`${tool.name} – Details anzeigen`}
                       className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors ${
                         selectedTool === tool.id
                           ? 'bg-blue-600/20 border border-blue-500/30 text-blue-300'
@@ -125,22 +161,45 @@ export function ToolsPage() {
                         <div className="text-sm font-medium truncate">{tool.name}</div>
                         <div className="text-xs text-gray-500 truncate">{tool.description}</div>
                       </div>
-                      <button
+                      <span
+                        role="switch"
+                        aria-checked={tool.enabled}
+                        title={tool.enabled ? 'Aktiv – klicken zum Deaktivieren' : 'Inaktiv – klicken zum Aktivieren'}
                         onClick={(e) => { e.stopPropagation(); handleToggle(tool.id, !tool.enabled); }}
-                        className="flex-shrink-0"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handleToggle(tool.id, !tool.enabled);
+                          }
+                        }}
+                        tabIndex={0}
+                        className="flex-shrink-0 cursor-pointer rounded focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                       >
                         {tool.enabled ? (
                           <ToggleRight className="w-5 h-5 text-green-400" />
                         ) : (
                           <ToggleLeft className="w-5 h-5 text-gray-600" />
                         )}
-                      </button>
+                      </span>
                     </button>
                   ))}
                 </div>
               </div>
             );
           })}
+          {filteredTools.length === 0 && (
+            <div className="text-center py-8">
+              <Search className="w-8 h-8 mx-auto mb-2 text-gray-700" />
+              <p className="text-xs text-gray-500">Keine Tools gefunden für „{searchQuery}"</p>
+              <button
+                onClick={clearSearch}
+                className="mt-2 text-xs text-blue-400 hover:text-blue-300"
+              >
+                Suche zurücksetzen
+              </button>
+            </div>
+          )}
         </div>
       </div>
 

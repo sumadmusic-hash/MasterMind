@@ -137,7 +137,8 @@ export function WorkflowPage() {
     setSelectedWorkflow(workflow);
     setShowSaved(true);
     setTimeout(() => setShowSaved(false), 2000);
-    
+    showToast('Workflow gespeichert');
+
     // Refresh workflows list
     const workflows = await getWorkflows();
     dispatch({ type: 'SET_WORKFLOWS', payload: workflows });
@@ -221,16 +222,6 @@ export function WorkflowPage() {
     dispatch({ type: 'SET_WORKFLOWS', payload: workflows });
   };
 
-  const handleDelete = async (id: string) => {
-    await deleteWorkflow(id);
-    const workflows = await getWorkflows();
-    dispatch({ type: 'SET_WORKFLOWS', payload: workflows });
-    if (selectedWorkflow?.id === id) {
-      setSelectedWorkflow(null);
-      createNewWorkflow();
-    }
-  };
-
   const handleLoadWorkflow = (wf: WorkflowDefinition) => {
     setSelectedWorkflow(wf);
     setWorkflowName(wf.name);
@@ -246,6 +237,30 @@ export function WorkflowPage() {
       source: e.source,
       target: e.target,
     })));
+  };
+
+  // Unsaved-changes guard for delete + a lightweight toast
+  const [toast, setToast] = useState('');
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2500);
+  };
+
+  const isDirty = !!selectedWorkflow && (
+    workflowName !== selectedWorkflow.name ||
+    workflowDesc !== selectedWorkflow.description
+  );
+
+  const handleDelete = async (id: string) => {
+    if (!window.confirm('Diesen Workflow wirklich löschen?')) return;
+    await deleteWorkflow(id);
+    const workflows = await getWorkflows();
+    dispatch({ type: 'SET_WORKFLOWS', payload: workflows });
+    if (selectedWorkflow?.id === id) {
+      setSelectedWorkflow(null);
+      createNewWorkflow();
+    }
+    showToast('Workflow gelöscht');
   };
 
   const handleGenerateFromAI = () => {
