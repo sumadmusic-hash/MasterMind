@@ -158,6 +158,13 @@ async function executeProviderCall(
     temperature: 0.7,
   };
 
+  if (body.stream) {
+    // Ask the provider to include real token usage in the final stream chunk;
+    // without it we can only estimate (which distorts TPM budgeting and the
+    // usage dashboard). Does not change response content/quality.
+    body.stream_options = { include_usage: true };
+  }
+
   if (tools && tools.length > 0) {
     body.tools = tools.map(t => ({
       type: 'function',

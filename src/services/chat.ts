@@ -1,27 +1,18 @@
 import type { ChatMessage, ChatSession, AppSettings, ToolCall, ToolResult, Source } from '../types';
 import { callProvider, type ProviderMessage } from './provider';
-import { toolRegistry } from './tools';
+import { toolRegistry, compactToolData } from './tools';
 import { saveChatSession, getChatSession } from './database';
 import { addLog } from './database';
 
-const SYSTEM_PROMPT = `You are an AI research assistant. You help users research topics, analyze news, look up company information, and check stock prices.
+// Compact system prompt: the tool list was removed because full tool names,
+// descriptions and schemas are already sent via the API "tools" parameter —
+// repeating them here only wasted prompt tokens on every request. All quality
+// guardrails (citations, fact/analysis separation, etc.) are preserved.
+const SYSTEM_PROMPT = `You are an AI research assistant helping users research topics, analyze news, look up companies, and check stock prices.
 
-You have access to various tools that you can use to gather information:
-- web_search: Search the web for current information
-- news_search: Search for recent news articles
-- company_lookup: Look up company info and ticker symbols
-- stock_price: Get stock price data
-- data_filter: Filter and process data
-- text_summarize: Summarize text content
-- generate_report: Create structured reports
-- url_fetch: Fetch content from URLs
-
-When you need information, use the appropriate tools. Always cite your sources.
-Distinguish between verified facts, your analysis, and uncertainties.
-When comparing data (e.g., news and stock prices), note that correlation does not imply causation.
-If data is unavailable, state this clearly.
-
-Respond in the same language the user uses. Be concise but thorough.`;
+Use the provided tools to gather information when needed. Always cite sources.
+Separate verified facts from analysis and uncertainty; correlation is not causation. State clearly if data is unavailable.
+Respond in the user's language, concise but thorough.`;
 
 export interface ChatOrchestratorCallbacks {
   onToken: (token: string) => void;
@@ -84,6 +75,10 @@ export class ChatOrchestrator {
     let currentProvider = '';
     let totalTokens = 0;
     const sources: Source[] = [];
+    // Deduplicate tool calls by (name + arguments): models often repeat the
+    // exact same call across steps, which wastes both execution time and
+    // prompt tokens for the duplicated results.
+    const seenToolSignatures = new Set<string>();
 
     // Agent loop: keep calling until no more tool calls or max steps reached
     for (let step = 0; step < this.maxToolSteps; step++) {
@@ -183,6 +178,19 @@ export class ChatOrchestrator {
           timestamp: Date.now(),
         };
 
+        // Skip identical tool calls already executed in this turn; return the
+        // cached result to the model so the tool-call protocol stays valid.
+        const signature = `${toolName}:${JSON.stringify(toolArgs)}`;
+        if (seenToolSignatures.has(signature)) {
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }),
+            tool_call_id: callId,
+          });
+          continue;
+        }
+        seenToolSignatures.add(signature);
+
         callbacks.onToolCall(toolCall);
         callbacks.onStatus(`Running: ${toolName}...`);
 
@@ -207,10 +215,11 @@ export class ChatOrchestrator {
           }
         }
 
-        // Add tool result to messages
+        // Add tool result to messages (compacted: raw results would otherwise
+        // be re-sent as prompt tokens on every remaining agent step)
         messages.push({
           role: 'tool',
-          content: JSON.stringify(result.success ? result.data : { error: result.error }),
+          content: JSON.stringify(result.success ? compactToolData(result.data) : { error: result.error }),
           tool_call_id: callId,
         });
 
@@ -246,26 +255,36 @@ export class ChatOrchestrator {
       if (msg.role === 'user') {
         messages.push({ role: 'user', content: msg.content });
       } else if (msg.role === 'assistant') {
-        const assistantMsg: ProviderMessage = { role: 'assistant', content: msg.content };
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          assistantMsg.tool_calls = msg.toolCalls.map(tc => ({
-            id: tc.id,
-            type: 'function',
-            function: { name: tc.toolId, arguments: JSON.stringify(tc.arguments) },
-          }));
-        }
-        messages.push(assistantMsg);
-      } else if (msg.role === 'tool' && msg.toolResults) {
-        for (const tr of msg.toolResults) {
-          messages.push({
-            role: 'tool',
-            content: JSON.stringify(tr.success ? tr.data : { error: tr.error }),
-            tool_call_id: tr.callId,
-          });
-        }
+        // History tool calls/results are no longer actionable for the model
+        // (they were already summarized in the assistant's reply), so we drop
+        // them from prior turns. This cuts prompt tokens dramatically in long
+        // sessions while keeping the full conversational text intact.
+        messages.push({ role: 'assistant', content: msg.content });
       }
+      // Historical 'tool' messages are intentionally skipped (see above).
     }
 
+    return this.fitToContextWindow(messages);
+  }
+
+  /**
+   * Hard cap on prompt size: keep system prompt + most recent messages that
+   * fit into a fraction of the model's context window. Prevents runaway token
+   * spend and provider errors on very long sessions; the current turn's tool
+   * results are added separately in the agent loop, so they are never lost.
+   */
+  private fitToContextWindow(messages: ProviderMessage[]): ProviderMessage[] {
+    const MAX_HISTORY_TOKENS = 24000; // ~ chars/4 estimate, well under 128k windows
+    let total = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+    let start = 0;
+    // Always keep the system message (index 0) and at least the last message.
+    while (total > MAX_HISTORY_TOKENS && start < messages.length - 2) {
+      total -= messages[start + 1].content?.length || 0;
+      start++;
+    }
+    if (start > 0) {
+      return [messages[0], ...messages.slice(start + 1)];
+    }
     return messages;
   }
 

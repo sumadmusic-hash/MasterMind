@@ -23,6 +23,8 @@ class ToolRegistry {
   }
 
   getToolDefinitionsForLLM(): any[] {
+    // Only send inputSchema to the LLM — outputSchema is not part of the
+    // OpenAI tool-call format and would only inflate prompt tokens.
     return this.getEnabledTools().map(t => ({
       name: t.id,
       description: t.description,
@@ -105,6 +107,33 @@ class ToolRegistry {
 }
 
 export const toolRegistry = new ToolRegistry();
+
+/**
+ * Trim verbose JSON values before they are sent back to the model as tool
+ * results (they count as prompt tokens on every subsequent agent step).
+ * Strings are shortened, long arrays are capped; structure stays intact so
+ * the model still sees all relevant fields.
+ */
+export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8): any {
+  if (typeof data === 'string') {
+    return data.length > maxStringLen ? data.slice(0, maxStringLen) + '…' : data;
+  }
+  if (Array.isArray(data)) {
+    const items = data.slice(0, maxArrayLen).map(item => compactToolData(item, maxStringLen, maxArrayLen));
+    if (data.length > maxArrayLen) {
+      items.push({ truncated: `${data.length - maxArrayLen} more items omitted` });
+    }
+    return items;
+  }
+  if (data && typeof data === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(data)) {
+      out[k] = compactToolData(v, maxStringLen, maxArrayLen);
+    }
+    return out;
+  }
+  return data;
+}
 
 // ============ Built-in Tool Implementations ============
 
