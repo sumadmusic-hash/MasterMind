@@ -12,6 +12,28 @@ class TokenPerMinuteManager {
   private reservations: Map<string, Reservation> = new Map();
   private usageLog: { provider: string; tokens: number; timestamp: number }[] = [];
   private windowMs = 60000; // 60 seconds
+  // Lightweight change notification so the UI can re-render ONLY when the
+  // displayed budget numbers actually changed (instead of a fixed 2s poll
+  // that forced every context consumer to re-render around the clock).
+  private listeners = new Set<(budget: TokenBudget) => void>();
+  private lastSignature = '';
+
+  private signature(): string {
+    return `${this.budget.globalLimit}|${this.budget.usedInWindow}|${this.budget.reserved}`;
+  }
+
+  private notifyIfChanged(): void {
+    const sig = this.signature();
+    if (sig === this.lastSignature) return;
+    this.lastSignature = sig;
+    const snapshot = this.getBudget();
+    for (const listener of this.listeners) listener(snapshot);
+  }
+
+  subscribe(listener: (budget: TokenBudget) => void): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
 
   constructor() {
     this.budget = {
@@ -66,6 +88,7 @@ class TokenPerMinuteManager {
         this.budget.perProvider[provider].used = 0;
       }
     }
+    this.notifyIfChanged();
   }
 
   private cleanWindow(): void {
@@ -142,6 +165,7 @@ class TokenPerMinuteManager {
       timestamp: Date.now(),
     });
     this.budget.reserved += tokens;
+    this.notifyIfChanged();
 
     return id;
   }
@@ -170,6 +194,10 @@ class TokenPerMinuteManager {
       // for this provider so reserved tokens never leak permanently.
       this.releaseReservation(provider);
     }
+    // usedInWindow steigt erst, wenn cleanWindow() den Log neu summiert –
+    // hier bereits benachrichtigen, damit das UI die Reservierung sieht.
+    this.cleanWindow();
+    this.notifyIfChanged();
   }
 
   releaseReservation(_provider: string, reservationId?: string): void {
@@ -180,6 +208,7 @@ class TokenPerMinuteManager {
         this.reservations.delete(reservationId);
         this.budget.reserved = Math.max(0, this.budget.reserved - res.tokens);
       }
+      this.notifyIfChanged();
       return;
     }
     // Release oldest reservation for this provider
@@ -190,10 +219,14 @@ class TokenPerMinuteManager {
         break;
       }
     }
+    this.notifyIfChanged();
   }
 
   getBudget(): TokenBudget {
     this.cleanWindow();
+    // Benachrichtige Listener, falls sich die Anzeige-Werte durch das
+    // Zeitfenster-Rolling geändert haben (z. B. abgelaufene Nutzung).
+    this.notifyIfChanged();
     return { ...this.budget };
   }
 

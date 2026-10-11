@@ -1,14 +1,27 @@
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { AppProvider, useApp } from './store/AppContext';
-import { ChatPage } from './pages/ChatPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { ToolsPage } from './pages/ToolsPage';
-import { WorkflowPage } from './pages/WorkflowPage';
-import { ResearchPage } from './pages/ResearchPage';
 import {
   MessageSquare, Settings, Wrench, GitBranch, Newspaper,
-  Menu, X, BarChart3, Zap
+  Menu, X, BarChart3, Zap, Loader2
 } from 'lucide-react';
+
+// Code-Splitting: nur die Chat-Seite wird sofort geladen (Standardansicht).
+// Die übrigen Seiten (inkl. schwerer Abhängigkeiten wie @xyflow/react für
+// Workflows) werden per React.lazy on-demand als eigene Chunks geladen –
+// das reduziert die Initial Load deutlich.
+const ChatPage = lazy(() => import('./pages/ChatPage').then(m => ({ default: m.ChatPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
+const ToolsPage = lazy(() => import('./pages/ToolsPage').then(m => ({ default: m.ToolsPage })));
+const WorkflowPage = lazy(() => import('./pages/WorkflowPage').then(m => ({ default: m.WorkflowPage })));
+const ResearchPage = lazy(() => import('./pages/ResearchPage').then(m => ({ default: m.ResearchPage })));
+
+function PageFallback() {
+  return (
+    <div className="h-full flex items-center justify-center">
+      <Loader2 className="w-5 h-5 animate-spin text-gray-500" />
+    </div>
+  );
+}
 
 const PAGE_KEYS: Record<string, string> = {
   '1': 'chat',
@@ -159,7 +172,9 @@ function AppContent() {
 
         {/* Page Content */}
         <div className="flex-1 overflow-hidden">
-          {renderPage()}
+          <Suspense fallback={<PageFallback />}>
+            {renderPage()}
+          </Suspense>
         </div>
       </main>
     </div>

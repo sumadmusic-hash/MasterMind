@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useEffect, type ReactNode } from 'react';
+import { createContext, useContext, useReducer, useEffect, useMemo, type ReactNode } from 'react';
 import type { AppSettings, ChatSession, WorkflowDefinition, TokenBudget } from '../types';
 import { getSettings, saveSettings, getChatSessions, getWorkflows } from '../services/database';
 import { tpmManager } from '../services/tpm';
@@ -9,6 +9,10 @@ interface AppState {
   chatSessions: ChatSession[];
   activeSession: ChatSession | null;
   workflows: WorkflowDefinition[];
+  // Token-Budget wird NUR noch bei echten Änderungen gesetzt (vergleiche
+  // tpmManager.subscribe unten). Vorher wurde alle 2s ein neuer Budget-Wert
+  // dispatched – dadurch haben alle Context-Konsumenten (App + alle Seiten)
+  // dauerhaft mitgerendert, auch ohne jede Änderung.
   tokenBudget: TokenBudget | null;
   sidebarOpen: boolean;
   currentPage: string;
@@ -107,12 +111,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     load();
   }, []);
 
-  // Update token budget periodically
+  // Token-Budget: Update NUR bei echten Änderungen (subscribe) plus ein
+  // leichter 5s-Ticker, der ablaufende Fenster erkennt – statt previously
+  // alle 2s einen neuen State zu setzen und alles neu zu rendern.
   useEffect(() => {
+    dispatch({ type: 'SET_TOKEN_BUDGET', payload: tpmManager.getBudget() });
+    const unsubscribe = tpmManager.subscribe(budget => {
+      dispatch({ type: 'SET_TOKEN_BUDGET', payload: budget });
+    });
     const interval = setInterval(() => {
-      dispatch({ type: 'SET_TOKEN_BUDGET', payload: tpmManager.getBudget() });
-    }, 2000);
-    return () => clearInterval(interval);
+      // getBudget() löst bei geänderten Werten den Listener oben aus;
+      // ohne Änderung passiert kein Dispatch und kein Render.
+      tpmManager.getBudget();
+    }, 5000);
+    return () => { unsubscribe(); clearInterval(interval); };
   }, []);
 
   const updateSettings = async (updates: Partial<AppSettings>) => {
@@ -122,8 +134,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     tpmManager.configure(newSettings);
   };
 
+  // Provider-Value stabil halten: sonst bekommen ALLE Konsumenten bei jedem
+  // Parent-Render ein neues Objekt und renderen unnötig mit.
+  const value = useMemo(
+    () => ({ state, dispatch, updateSettings }),
+    [state, updateSettings]
+  );
+
   return (
-    <AppContext.Provider value={{ state, dispatch, updateSettings }}>
+    <AppContext.Provider value={value}>
       {children}
     </AppContext.Provider>
   );

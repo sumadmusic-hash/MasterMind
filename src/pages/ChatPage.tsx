@@ -21,6 +21,40 @@ export function ChatPage() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Batching für Streaming-Tokens: statt pro Token einen React-Render
+  // auszulösen, werden Tokens gesammelt und max. ~1x pro Frame (rAF)
+  // übernommen – das reduziert die Render-Last bei langem Output enorm.
+  const pendingTokensRef = useRef('');
+  const streamRafRef = useRef<number | null>(null);
+
+  const flushStreamTokens = useCallback(() => {
+    streamRafRef.current = null;
+    if (pendingTokensRef.current) {
+      const batch = pendingTokensRef.current;
+      pendingTokensRef.current = '';
+      setStreamContent(prev => prev + batch);
+    }
+  }, []);
+
+  const queueStreamToken = useCallback((token: string) => {
+    pendingTokensRef.current += token;
+    if (streamRafRef.current === null) {
+      streamRafRef.current = requestAnimationFrame(flushStreamTokens);
+    }
+  }, [flushStreamTokens]);
+
+  const resetStreamContent = useCallback(() => {
+    if (streamRafRef.current !== null) {
+      cancelAnimationFrame(streamRafRef.current);
+      streamRafRef.current = null;
+    }
+    pendingTokensRef.current = '';
+    setStreamContent('');
+  }, []);
+
+  useEffect(() => () => {
+    if (streamRafRef.current !== null) cancelAnimationFrame(streamRafRef.current);
+  }, []);
 
   const session = state.activeSession;
 
@@ -76,18 +110,18 @@ export function ChatPage() {
       payload: [newSession, ...state.chatSessions],
     });
     setError('');
-    setStreamContent('');
+    resetStreamContent();
     setToolCalls([]);
     setToolResults([]);
-  }, [dispatch, state.chatSessions]);
+  }, [dispatch, state.chatSessions, resetStreamContent]);
 
   const selectSession = useCallback((s: ChatSession) => {
     dispatch({ type: 'SET_ACTIVE_SESSION', payload: s });
     setError('');
-    setStreamContent('');
+    resetStreamContent();
     setToolCalls([]);
     setToolResults([]);
-  }, [dispatch]);
+  }, [dispatch, resetStreamContent]);
 
   const handleDeleteSession = async (id: string) => {
     await deleteChatSession(id);
@@ -151,7 +185,7 @@ export function ChatPage() {
     };
 
     setStreaming(true);
-    setStreamContent('');
+    resetStreamContent();
     setError('');
     setToolCalls([]);
     setToolResults([]);
@@ -167,7 +201,7 @@ export function ChatPage() {
         userInput,
         {
           onToken: (token) => {
-            setStreamContent(prev => prev + token);
+            queueStreamToken(token);
           },
           onToolCall: (call) => {
             setToolCalls(prev => [...prev, call]);
@@ -192,7 +226,7 @@ export function ChatPage() {
             };
             syncSession(updated);
             setStreaming(false);
-            setStreamContent('');
+            resetStreamContent();
             setStatus('');
           },
           onError: (err) => {
@@ -200,7 +234,7 @@ export function ChatPage() {
             // Persist the partial turn (user message etc.) so it survives reload
             syncSession({ ...currentSession, messages: [...currentSession.messages] });
             setStreaming(false);
-            setStreamContent('');
+            resetStreamContent();
             setStatus('');
           },
           onStatus: (s) => {
