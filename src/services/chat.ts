@@ -532,14 +532,47 @@ export class ChatOrchestrator {
         if (this.processedToolCalls.has(callId)) continue;
         this.processedToolCalls.add(callId);
 
-        const toolName = tc.function?.name || tc.name || '';
+        const toolName = (tc.function?.name || tc.name || '').trim();
         let toolArgs: Record<string, any> = {};
+        // True when the model streamed argument JSON that couldn't be parsed
+        // (truncated/half-streamed payload) — such calls must not run with an
+        // empty argument object, see the guard below.
+        let malformedArgs = false;
 
         try {
           const argsStr = tc.function?.arguments || tc.arguments || '{}';
           toolArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr;
         } catch {
+          // Truncated/invalid argument JSON (e.g. a half-streamed `{"q`) must
+          // NOT be executed as an empty call — that produced bogus errors like
+          // 'Pflicht-Parameter "query" fehlt'. Normalize to {} and flag it so
+          // the model gets a clear, self-correctable error back.
           toolArgs = {};
+          malformedArgs = true;
+        }
+        if (toolArgs === null || typeof toolArgs !== 'object' || Array.isArray(toolArgs)) {
+          toolArgs = {};
+          malformedArgs = true;
+        }
+
+        // Guard against garbage calls reaching the registry: models (and old
+        // buggy delta-forwarding code) can emit calls with an empty name or no
+        // payload at all. Answer them via the protocol with a precise error
+        // instead of executing "Tool not found: ".
+        const isEmptyFragment = !toolName && Object.keys(toolArgs).length === 0;
+        if (!toolName || isEmptyFragment || malformedArgs) {
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({
+              error: !toolName
+                ? 'Ungültiger Tool-Aufruf: Der Tool-Name fehlt. Verfügbare Tools: ' + toolRegistry.getEnabledTools().map(t => t.id).join(', ')
+                : malformedArgs && toolName
+                  ? `Ungültige bzw. unvollständige Argumente für "${toolName}" (JSON konnte nicht geparst werden). Rufe das Tool erneut mit vollständigem JSON-Arguments-Objekt auf.`
+                  : 'Ungültiger (leerer) Tool-Aufruf ohne Name und Argumente – ignoriert.',
+            }),
+            tool_call_id: callId,
+          });
+          continue;
         }
 
         const toolCall: ToolCall = {
