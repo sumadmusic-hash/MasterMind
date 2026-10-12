@@ -1,6 +1,12 @@
 import type { ToolDefinition, ToolCall, ToolResult, Source } from '../types';
 import { getSettings } from './database';
 
+// scheduler.ts statically imports this module (setExecutionOrigin). Use a
+// lazy dynamic import for the reverse direction so there is no ESM cycle.
+async function loadScheduler() {
+  return import('./scheduler');
+}
+
 /**
  * Per-turn marker for scheduler-initiated executions (set by AppContext via
  * `__setManualMarkerForTests`-style injection in scheduler.ts). Tools that
@@ -2964,20 +2970,15 @@ toolRegistry.register({
   builtin: true,
 }, async (args) => {
   assertInteractive(args);
-  if (!isValidScheduleSpec(String(args.schedule))) {
-    throw new Error(`Ungültiges Schedule "${args.schedule}". Erlaubt: @hourly, @daily, @weekly oder Zahl+m|h|d (min. 1m).`);
-  }
-  const job: ScheduledJob = {
-    id: crypto.randomUUID(),
+  // Delegate to schedulerService so UI and agent create jobs through the same
+  // code path (validation, nextRun anchoring, logging — no duplicated logic).
+  const { schedulerService } = await loadScheduler();
+  const job = await schedulerService.createJob({
     name: String(args.name).slice(0, 80),
-    schedule: String(args.schedule).trim().toLowerCase(),
+    schedule: String(args.schedule),
     workflowId: String(args.workflowId),
     inputs: args.inputs && typeof args.inputs === 'object' ? args.inputs : undefined,
-    enabled: true,
-    consecutiveFailures: 0,
-    createdAt: Date.now(),
-  };
-  await saveScheduledJob(job);
+  });
   return { created: true, jobId: job.id, name: job.name, schedule: job.schedule, note: 'Der Scheduler prüft alle 30s; Job erscheint unter Einstellungen → Geplante Jobs.' };
 });
 

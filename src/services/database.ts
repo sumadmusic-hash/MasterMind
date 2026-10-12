@@ -238,6 +238,16 @@ export async function getScheduledJobs(): Promise<ScheduledJob[]> {
   return db.scheduledJobs.toArray();
 }
 
+export async function getScheduledJob(id: string): Promise<ScheduledJob | undefined> {
+  return db.scheduledJobs.get(id);
+}
+
+/** Chronological run history of one job (oldest first), capped by `limit`. */
+export async function getScheduledRuns(jobId: string, limit = 20): Promise<ScheduledRun[]> {
+  const runs = await db.scheduledRuns.where('jobId').equals(jobId).toArray();
+  return runs.sort((a, b) => a.startedAt - b.startedAt).slice(-limit);
+}
+
 export async function saveScheduledJob(job: ScheduledJob): Promise<void> {
   await db.scheduledJobs.put(job);
 }
