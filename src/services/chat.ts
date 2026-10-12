@@ -792,14 +792,16 @@ export class ChatOrchestrator {
       { role: 'system', content: SYSTEM_PROMPT },
     ];
 
+    // History tool calls/results are NOT replayed into follow-up prompts: the
+    // assistant's final answer already summarises them, and every retained
+    // tool result is re-sent as prompt tokens on EVERY provider call —
+    // including all follow-up steps of the agent loop. Dropping them keeps a
+    // new question cheap even after a tool-heavy previous turn (the model can
+    // simply re-run a tool if it truly needs fresh data).
     for (const msg of chatMessages) {
       if (msg.role === 'user') {
         messages.push({ role: 'user', content: msg.content });
       } else if (msg.role === 'assistant') {
-        // History tool calls/results are no longer actionable for the model
-        // (they were already summarized in the assistant's reply), so we drop
-        // them from prior turns. This cuts prompt tokens dramatically in long
-        // sessions while keeping the full conversational text intact.
         messages.push({ role: 'assistant', content: msg.content });
       }
       // Historical 'tool' messages are intentionally skipped (see above).
@@ -815,12 +817,23 @@ export class ChatOrchestrator {
    * results are added separately in the agent loop, so they are never lost.
    */
   private fitToContextWindow(messages: ProviderMessage[]): ProviderMessage[] {
-    const MAX_HISTORY_TOKENS = 24000; // ~ chars/4 estimate, well under 128k windows
-    let total = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+    const MAX_HISTORY_TOKENS = 8000; // ~ chars/4 estimate — comfortably below even small free-model windows (32k) once the tool catalogue (~2k tokens) is added on top
+    let total = 0;
+    const sizes = messages.map(m => {
+      // Tool-call payloads count toward the prompt too — previously only
+      // `content` was measured, so truncation could still ship an oversized
+      // prompt when history carried tool calls.
+      let chars = m.content?.length || 0;
+      if (m.tool_calls) {
+        try { chars += JSON.stringify(m.tool_calls).length; } catch { /* ignore */ }
+      }
+      total += chars;
+      return chars;
+    });
     let start = 0;
     // Always keep the system message (index 0) and at least the last message.
     while (total > MAX_HISTORY_TOKENS && start < messages.length - 2) {
-      total -= messages[start + 1].content?.length || 0;
+      total -= sizes[start + 1];
       start++;
     }
     if (start > 0) {

@@ -153,6 +153,37 @@ function getApiKey(settings: AppSettings, provider: string): string | undefined 
   }
 }
 
+/**
+ * Normalise a tool input schema into minimal standard JSON Schema for the API
+ * wire format. Tool schemas are plain objects today, but custom/workflow tools
+ * can carry Zod-like instances with internal keys (`_def`, `typeName`, …) that
+ * JSON.stringify happily serialises into the request body — every one of those
+ * bytes is billed as PROMPT tokens on EVERY agent step (the tool list is
+ * re-sent with each request). Recursively strip non-standard keys and drop
+ * empty descriptions so only what the model actually needs goes over the wire.
+ */
+export function normalizeJsonSchema(schema: any): any {
+  if (schema === null || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(normalizeJsonSchema);
+
+  // Zod-style instance: take its embedded JSON definition when present.
+  const def = schema._def?.schema ?? schema._def ?? schema;
+
+  const STANDARD_KEYS = [
+    'type', 'properties', 'items', 'required', 'enum', 'description',
+    'additionalProperties', 'anyOf', 'oneOf', 'allOf', 'format',
+    'minimum', 'maximum', 'default',
+  ];
+  const out: Record<string, any> = {};
+  for (const key of Object.keys(def)) {
+    if (!STANDARD_KEYS.includes(key)) continue;
+    const value = def[key];
+    if (key === 'description' && (typeof value !== 'string' || !value.trim())) continue;
+    out[key] = normalizeJsonSchema(value);
+  }
+  return out;
+}
+
 function estimateTokens(messages: ProviderMessage[]): number {
   // Rough estimation: ~4 chars per token. Tool-call payloads must be counted
   // too — they are part of the prompt but were previously ignored entirely,
@@ -383,12 +414,20 @@ async function executeProviderCall(
   }
 
   if (tools && tools.length > 0) {
+    // NOTE: the `tools` array is billed as PROMPT tokens on EVERY request —
+    // including every follow-up step of an agent loop, where the whole tool
+    // catalogue is re-sent alongside the growing message history. Keep the
+    // wire format minimal here: OpenRouter/Groq accept a JSON Schema object
+    // directly in `parameters`, so Zod-style schemas (which carry internal
+    // keys like `_def`/`typeName` that add nothing for the model but cost
+    // thousands of prompt tokens) are normalised down to standard JSON Schema
+    // before being sent.
     body.tools = tools.map(t => ({
       type: 'function',
       function: {
         name: t.name,
         description: t.description,
-        parameters: t.inputSchema,
+        parameters: normalizeJsonSchema(t.inputSchema),
       },
     }));
   }
