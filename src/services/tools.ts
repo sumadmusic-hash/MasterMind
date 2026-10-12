@@ -2036,14 +2036,11 @@ async function fetchYahooFundamentals(ticker: string): Promise<any | null> {
     } catch { /* fall through */ }
   }
 
-  // C) chart meta — reliable, no auth required
+  // C) chart meta — reliable, no auth required (helper survives HTML/429 pages)
   if (Object.keys(out).length === 0) {
     try {
-      const resp = await fetch(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=1y&interval=1mo`,
-        { headers, signal: AbortSignal.timeout(7000) }
-      );
-      const meta = (await resp.json())?.chart?.result?.[0]?.meta;
+      const data = await fetchYahooChartJson(ticker, 'range=1y&interval=1mo');
+      const meta = data?.chart?.result?.[0]?.meta;
       if (meta?.regularMarketPrice !== undefined) {
         out = {
           longName: meta.longName || meta.shortName,
@@ -2056,7 +2053,37 @@ async function fetchYahooFundamentals(ticker: string): Promise<any | null> {
           source: 'yahoo-chart-meta',
         };
       }
-    } catch { /* give up */ }
+    } catch { /* fall through to last-resort fallback */ }
+  }
+
+  // D) last resort: CoinGecko for cryptos. Yahoo is intermittently rate-limited
+  // (HTTP 429 + HTML body); crypto questions should still get a real price.
+  if (Object.keys(out).length === 0) {
+    const CG_IDS: Record<string, string> = {
+      'BTC-USD': 'bitcoin', 'ETH-USD': 'ethereum', 'SOL-USD': 'solana',
+      'XRP-USD': 'ripple', 'DOGE-USD': 'dogecoin', 'LTC-USD': 'litecoin',
+      'ADA-USD': 'cardano', 'DOT-USD': 'polkadot', 'LINK-USD': 'chainlink',
+    };
+    const cgId = CG_IDS[ticker.toUpperCase()];
+    if (cgId) {
+      try {
+        const resp = await fetch(
+          `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`,
+          { headers, signal: AbortSignal.timeout(7000) }
+        );
+        const d = resp.ok ? (await resp.json().catch(() => null))?.[cgId] : null;
+        if (typeof d?.usd === 'number') {
+          out = {
+            longName: ticker.toUpperCase(),
+            currency: 'USD',
+            fullExchangeName: 'CoinGecko',
+            regularMarketPrice: d.usd,
+            regularMarketChangePercent: d.usd_24h_change,
+            source: 'coingecko',
+          };
+        }
+      } catch { /* give up */ }
+    }
   }
 
   if (Object.keys(out).length === 0) return null;
@@ -2156,10 +2183,74 @@ const TICKER_ALIASES: Record<string, string> = {
 };
 
 function resolveTicker(raw: unknown): string {
-  const t = String(raw ?? '').trim().toUpperCase();
+  let t = String(raw ?? '').trim().toUpperCase();
   if (!t) return t;
+  // The model often passes the whole user query instead of a bare symbol
+  // ("wie ist der DAX Kurs aktuell?", "DAX Index Stand heute"). Strip common
+  // German question/noise words so the remaining text can still match an alias.
+  const cleaned = t
+    .replace(/[^A-Z0-9^.\- ]/g, ' ')       // drop punctuation like ?, !, %
+    .split(/\s+/)
+    .filter((w) => w && !/^(WIE|IST|DER|DIE|DAS|AKTUELL|AKTUELLE|KURS|KURSE|KURSES|STAND|PREIS|HEUTE|JETZT|GERADE|INDEX|INDEXSTAND|VERLAUF|ENTWICKLUNG|VON|FÜR|FUER|IN|AUC|MIR|UNSER|DE)$/.test(w))
+    .join(' ');
+  if (cleaned) t = cleaned.toUpperCase();
   const compact = t.replace(/[\s._-]/g, ''); // "Dax 40", "Tec-DAX" → "DAX40", "TECDAX"
   return TICKER_ALIASES[t] || TICKER_ALIASES[compact] || t;
+}
+
+/**
+ * Fetch a Yahoo Finance v8 chart payload as JSON.
+ *
+ * Fixes the "stock_price … HTML‑Fehler" bug: Yahoo answers with HTTP 429 and
+ * an HTML body ("Edge: Too Many Requests") — sometimes even with status 200 —
+ * when the request is rate-limited or blocked. `response.json()` then threw a
+ * raw SyntaxError ("Unexpected token '<', "<!DOCTYPE…" is not valid JSON),
+ * which surfaced to the model as an opaque failure. This helper:
+ *   1. treats any non-JSON (HTML) response as a retryable error,
+ *   2. retries on other hosts / after a short backoff,
+ *   3. returns a clear German error message instead of a JSON syntax error.
+ */
+async function fetchYahooChartJson(ticker: string, query: string): Promise<any> {
+  const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+  const ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+  let lastError = '';
+  // Overall time budget — the tool wrapper may still hit its maxDuration, but
+  // we never hang longer than this and always end with a clear error message.
+  const deadline = Date.now() + 20000;
+  for (let attempt = 0; attempt < hosts.length * 2 && Date.now() < deadline; attempt++) {
+    const host = hosts[attempt % hosts.length];
+    const url = `https://${host}/v8/finance/chart/${encodeURIComponent(ticker)}?${query}`;
+    try {
+      const resp = await fetch(url, { headers: { 'User-Agent': ua, 'Accept': 'application/json' }, signal: AbortSignal.timeout(9000) });
+      const ct = resp.headers.get('content-type') || '';
+      if (resp.status === 429) {
+        lastError = `Rate-Limit (HTTP 429) von ${host}`;
+      } else if (!resp.ok) {
+        // 4xx on one symbol is permanent (unknown ticker) — no point retrying.
+        if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+          throw new Error(`Keine Daten für "${ticker}" gefunden (HTTP ${resp.status} von ${host}).`);
+        }
+        lastError = `HTTP ${resp.status} von ${host}`;
+      } else if (!ct.includes('json')) {
+        // HTML error page despite ok status — the classic "Edge: Too Many Requests".
+        lastError = `HTML statt JSON erhalten (${ct || 'unknown content-type'})`;
+      } else {
+        const data = await resp.json().catch(() => null);
+        if (data && typeof data === 'object') return data;
+        lastError = 'Antwort enthielt kein gültiges JSON';
+      }
+    } catch (err: any) {
+      if (/^Keine Daten für/.test(String(err?.message || ''))) throw err;
+      const msg = String(err?.message || err);
+      // Translate the raw JSON syntax error into something actionable.
+      lastError = /not valid JSON|Unexpected token/i.test(msg)
+        ? 'HTML-Fehlerseite statt JSON erhalten (wahrscheinlich Rate-Limit von Yahoo)'
+        : msg;
+    }
+    // brief backoff before the next host/attempt
+    await new Promise((r) => setTimeout(r, 300 + attempt * 200));
+  }
+  throw new Error(`Yahoo Finance nicht erreichbar für ${ticker}: ${lastError}. Bitte später erneut versuchen oder web_search nutzen.`);
 }
 
 // Stock Price Tool
@@ -2197,17 +2288,10 @@ toolRegistry.register({
   const days = args.days || 7;
   
   try {
-    // Using Yahoo Finance query API (free, no key required for basic data)
-    const response = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${days}d&interval=1d`,
-      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(9000) }
-    );
-    
-    if (!response.ok) {
-      return { ticker, error: `Could not fetch data for ${ticker}. Status: ${response.status}`, found: false };
-    }
-    
-    const data = await response.json();
+    // Yahoo Finance query API (free, no key required for basic data). The
+    // shared helper retries on other hosts and translates HTML/429 error
+    // pages into a clear message instead of a raw JSON SyntaxError.
+    const data = await fetchYahooChartJson(ticker, `range=${days}d&interval=1d`);
     const result = data.chart?.result?.[0];
     
     if (!result) {
@@ -2222,14 +2306,20 @@ toolRegistry.register({
       date: new Date(ts * 1000).toISOString().split('T')[0],
       close: closes[i] ? Math.round(closes[i] * 100) / 100 : null,
     })).filter((h: any) => h.close !== null);
-    
-    const currentPrice = historical.length > 0 ? historical[historical.length - 1].close : null;
-    const previousPrice = historical.length > 1 ? historical[historical.length - 2].close : null;
+
+    // Prefer the LIVE quote from meta.regularMarketPrice; the last daily bar
+    // can be stale (yesterday's close) while markets are open.
+    const livePrice = Number.isFinite(result.meta?.regularMarketPrice) ? result.meta.regularMarketPrice : null;
+    const currentPrice = livePrice ?? (historical.length > 0 ? historical[historical.length - 1].close : null);
+    const previousPrice = livePrice != null && Number.isFinite(result.meta?.chartPreviousClose)
+      ? result.meta.chartPreviousClose
+      : (historical.length > 1 ? historical[historical.length - 2].close : (historical.length > 0 ? historical[historical.length - 1].close : null));
     
     return {
       ticker,
       name: result.meta?.longName || result.meta?.shortName,
       price: currentPrice,
+      isLiveQuote: livePrice != null,
       dayHigh: result.meta?.regularMarketDayHigh,
       dayLow: result.meta?.regularMarketDayLow,
       fiftyTwoWeekHigh: result.meta?.fiftyTwoWeekHigh,
@@ -2243,9 +2333,35 @@ toolRegistry.register({
       found: true,
       dataNote: 'Data may be delayed 15-20 minutes. Not for trading decisions.',
     };
-  } catch (err: any) {
-    return { ticker, error: err.message, found: false };
-  }
+    } catch (err: any) {
+      // Last-resort fallback so a Yahoo rate-limit no longer means "no price":
+      // cryptos via CoinGecko (free, CORS-enabled, no key).
+      const CG_IDS: Record<string, string> = {
+        'BTC-USD': 'bitcoin', 'ETH-USD': 'ethereum', 'SOL-USD': 'solana',
+        'XRP-USD': 'ripple', 'DOGE-USD': 'dogecoin', 'LTC-USD': 'litecoin',
+        'ADA-USD': 'cardano', 'DOT-USD': 'polkadot', 'LINK-USD': 'chainlink',
+      };
+      const cgId = CG_IDS[ticker.toUpperCase()];
+      if (cgId) {
+        try {
+          const cgResp = await fetch(
+            `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`,
+            { signal: AbortSignal.timeout(7000) }
+          );
+          const cg = cgResp.ok ? (await cgResp.json().catch(() => null))?.[cgId] : null;
+          if (typeof cg?.usd === 'number') {
+            return {
+              ticker, name: ticker, price: Math.round(cg.usd * 100) / 100,
+              changePercent: typeof cg.usd_24h_change === 'number' ? Math.round(cg.usd_24h_change * 100) / 100 : null,
+              currency: 'USD', exchange: 'CoinGecko', found: true,
+              source: 'coingecko (Fallback, da Yahoo nicht erreichbar war)',
+              dataNote: 'Live-Krypto-Daten von CoinGecko.',
+            };
+          }
+        } catch { /* report the original error below */ }
+      }
+      return { ticker, error: err.message, found: false };
+    }
 });
 
 // Stock Analysis Tool — pre-computed risk/performance metrics from OHLC data,
@@ -2281,11 +2397,8 @@ toolRegistry.register({
   const interval = ['1d','1wk','1mo'].includes(args.interval) ? args.interval : '1d';
 
   try {
-    const resp = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${period}&interval=${interval}`,
-      { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(10000) }
-    );
-    const result = (await resp.json())?.chart?.result?.[0];
+    const data = await fetchYahooChartJson(ticker, `range=${period}&interval=${interval}`);
+    const result = data?.chart?.result?.[0];
     if (!result) return { ticker, found: false, error: `Keine Daten fuer ${ticker}` };
 
     const q = result.indicators?.quote?.[0] || {};
@@ -3072,11 +3185,9 @@ toolRegistry.register({
     let current: number | null = null;
     if (wantPrices) {
       try {
-        const resp = await fetch(
-          `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(p.ticker)}?range=1d&interval=1d`,
-          { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) }
-        );
-        const json: any = await resp.json();
+        // Robust against Yahoo HTML error pages (HTTP 429 "Edge: Too Many
+        // Requests") — a plain resp.json() there threw an opaque SyntaxError.
+        const json: any = await fetchYahooChartJson(p.ticker, 'range=1d&interval=1d');
         const meta = json?.chart?.result?.[0]?.meta;
         if (meta && Number.isFinite(meta.regularMarketPrice)) current = meta.regularMarketPrice;
       } catch { /* keep null */ }
