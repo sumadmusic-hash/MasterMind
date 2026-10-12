@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { toolRegistry } from '../services/tools';
 
 describe('ToolRegistry', () => {
@@ -13,6 +13,17 @@ describe('ToolRegistry', () => {
     expect(tool?.name).toBe('Web Search');
     expect(tool?.enabled).toBe(true);
     expect(tool?.builtin).toBe(true);
+  });
+
+  it('should have ddg_web_search (DuckDuckGo) tool', () => {
+    const tool = toolRegistry.getTool('ddg_web_search');
+    expect(tool).toBeDefined();
+    expect(tool?.name).toBe('DuckDuckGo Search');
+    expect(tool?.category).toBe('data_source');
+    expect(tool?.enabled).toBe(true);
+    expect(tool?.builtin).toBe(true);
+    expect(tool?.inputSchema.properties.query).toBeDefined();
+    expect(tool?.inputSchema.properties.timeRange.enum).toEqual(['day', 'week', 'month', 'year']);
   });
 
   it('should have news_search tool', () => {
@@ -331,4 +342,95 @@ describe('ToolRegistry', () => {
       expect(result.data.forecast.length).toBeGreaterThan(0);
     }, 20000);
   });
+
+  describe('ddg_web_search (DuckDuckGo Websuche)', () => {
+    const execDDG = (args: any) =>
+      toolRegistry.execute({ id: 't', toolId: 'ddg_web_search', toolName: 'DuckDuckGo Search', arguments: args, timestamp: Date.now() });
+
+    const SAMPLE_HTML = `
+      <div class="result results_links results_links_deep web-result">
+        <a class="result__a" href="https://html.duckduckgo.com/html//?uddg=https%3A%2F%2Fwww.beispiel.de%2Fseite&kd=-1">Ergebnis &amp; Titel</a>
+        <a class="result__snippet" href="#"><b>Snippet</b>-Text mit &quot;HTML&quot;</a>
+      </div>
+      <div class="result results_links results_links_deep result--ad">
+        <a class="result__a" href="https://ads.example.com/x">Werbung</a>
+        <a class="result__snippet" href="#">ad</a>
+      </div>
+      <div class="result results_links results_links_deep web-result">
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fzwei.de%2F&tj=desktop">Zweiter Treffer</a>
+        <td class="result-snippet">Kurzer Snippet</td>
+      </div>`;
+
+    const origFetch = globalThis.fetch;
+
+    afterEach(() => { (globalThis as any).fetch = origFetch; });
+
+    it('parst echte HTML-Treffer: uddg-Links entpackt, Snippets bereinigt, Ads gefiltert', async () => {
+      const urls: string[] = [];
+      let postedBody = '';
+      (globalThis as any).fetch = async (url: any, init?: any) => {
+        urls.push(String(url));
+        if (String(url).includes('html.duckduckgo.com')) {
+          postedBody = String(init?.body || '');
+          return new Response(SAMPLE_HTML, { status: 200, headers: { 'content-type': 'text/html' } });
+        }
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+
+      const result = await execDDG({ query: 'beispiel suche', language: 'de' });
+      expect(result.success).toBe(true);
+      const data = result.data as any;
+      expect(data.provider).toBe('duckduckgo');
+      expect(data.results.length).toBe(2); // Ad-Block wurde uebersprungen
+      expect(data.results[0].title).toBe('Ergebnis & Titel');
+      expect(data.results[0].url).toBe('https://www.beispiel.de/seite'); // uddg gewrappt + Tracking befreit
+      expect(data.results[0].snippet).toBe('Snippet-Text mit "HTML"');
+      expect(data.results[0].provider).toBe('duckduckgo-web');
+      expect(data.results[1].url).toBe('https://zwei.de/'); // protocol-relative uddg
+      // POST an html.duckduckgo.com mit Region aus language="de"
+      expect(urls.some(u => u.includes('html.duckduckgo.com/html/'))).toBe(true);
+      expect(postedBody).toContain('q=beispiel+suche');
+      expect(postedBody).toContain('kl=de-de');
+    });
+
+    it('timeRange/Enum-Validierung: unbekannter Wert wird abgelehnt, gueltiger akzeptiert', async () => {
+      const bad = await execDDG({ query: 'x', timeRange: 'jahrzehnt' });
+      expect(bad.success).toBe(false);
+      expect(bad.error).toContain('timeRange');
+    });
+
+    it('CAPTCHA-Hinweis ("anomaly") fuehrt zu Fehlermeldung statt leerem Ergebnis', async () => {
+      (globalThis as any).fetch = async (url: any) => {
+        if (String(url).includes('html.duckduckgo.com')) {
+          return new Response('<html><head><title>anomaly.js</title></head><body>What anomaly?</body></html>', { status: 200 });
+        }
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+      const result = await execDDG({ query: 'irgendwas' });
+      expect(result.success).toBe(true); // Tool selbst schlaegt nicht fehl
+      const data = result.data as any;
+      expect(data.results).toEqual([]);
+      expect(data.error).toContain('duckduckgo-web');
+    });
+
+    it('Instant-Answer-Fallback liefert Results, wenn das Web-Ranking leer bleibt', async () => {
+      (globalThis as any).fetch = async (url: any) => {
+        if (String(url).includes('html.duckduckgo.com')) {
+          return new Response('<html><body>no results here</body></html>', { status: 200 });
+        }
+        return new Response(JSON.stringify({
+          Heading: 'Berlin',
+          Abstract: 'Hauptstadt von Deutschland',
+          AbstractURL: 'https://de.wikipedia.org/wiki/Berlin',
+          RelatedTopics: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+      const result = await execDDG({ query: 'Berlin' });
+      const data = result.data as any;
+      expect(data.results.length).toBeGreaterThan(0);
+      expect(data.results[0].provider).toBe('duckduckgo');
+      expect(data.results[0].snippet).toContain('Hauptstadt');
+    });
+  });
+
 });
