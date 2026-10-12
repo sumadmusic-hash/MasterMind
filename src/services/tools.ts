@@ -272,7 +272,7 @@ toolRegistry.register({
     type: 'object',
     properties: {
       query: { type: 'string', description: 'Search query' },
-      maxResults: { type: 'number', description: 'Maximum results (default 10)' },
+      maxResults: { type: 'number', description: 'Maximum results (default 3, max 5)' },
     },
     required: ['query'],
   },
@@ -292,7 +292,9 @@ toolRegistry.register({
   maxDataSize: 50000,
   builtin: true,
 }, async (args) => {
-  const maxResults = args.maxResults || 10;
+  // Token sparen: Ergebnisse werden als Prompt-Tokens bei jedem Agent-Schritt
+  // erneut mitgesendet; kleine Defaults senken die Kosten ohne Qualitätsverlust.
+  const maxResults = Math.min(Math.max(Number(args.maxResults) || 3, 1), 5);
   const results: Source[] = [];
   const errors: string[] = [];
 
@@ -369,7 +371,10 @@ toolRegistry.register({
   }
 
   return {
-    results: results.slice(0, maxResults),
+    // URL-Deduplikation vor dem Zurückschicken an das Modell: Doppelte
+    // Treffer würden sonst als Prompt-Tokens bei jedem Agent-Schritt
+    // erneut mitgesendet und der Model-Kontext bläht sich unnötig auf.
+    results: dedupeByUrl(results).slice(0, maxResults),
     query: args.query,
     providers: [...new Set(results.map(r => r.provider))],
     ...(errors.length ? { partialErrors: errors } : {}),
@@ -387,7 +392,7 @@ toolRegistry.register({
     properties: {
       query: { type: 'string', description: 'News search query' },
       hoursBack: { type: 'number', description: 'How many hours back to search (default 48)' },
-      maxResults: { type: 'number', description: 'Maximum results (default 10)' },
+      maxResults: { type: 'number', description: 'Maximum results (default 3, max 5)' },
     },
     required: ['query'],
   },
@@ -404,7 +409,9 @@ toolRegistry.register({
   maxDataSize: 50000,
   builtin: true,
 }, async (args) => {
-  const maxResults = args.maxResults || 10;
+  // Token sparen: Ergebnisse werden als Prompt-Tokens bei jedem Agent-Schritt
+  // erneut mitgesendet; kleine Defaults senken die Kosten ohne Qualitätsverlust.
+  const maxResults = Math.min(Math.max(Number(args.maxResults) || 3, 1), 5);
   const hoursBack = args.hoursBack || 48;
   const errors: string[] = [];
 

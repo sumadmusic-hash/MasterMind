@@ -4,6 +4,16 @@ import { toolRegistry, compactToolData } from './tools';
 import { saveChatSession } from './database';
 import { addLog } from './database';
 
+/**
+ * Limits for tool results sent back to the model. Every retained result is
+ * re-billed as prompt tokens on EACH remaining agent step, so snippets and
+ * long strings are trimmed aggressively here — the model still sees title,
+ * URL and a usable excerpt per source, which is all citations and synthesis
+ * need (full text remains available via url_fetch when genuinely required).
+ */
+const COMPACT_RESULT_MAX_STRING = 150;
+const COMPACT_RESULT_MAX_ARRAY = 5;
+
 // Compact system prompt: the tool list was removed because full tool names,
 // descriptions and schemas are already sent via the API "tools" parameter —
 // repeating them here only wasted prompt tokens on every request. All quality
@@ -16,50 +26,24 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 - **NO FLUFF:** Keine Einleitungen, Übergänge, Höflichkeitsfloskeln, Zusammenfassungen des eigenen Vorgehens.
 - **OUTPUT FORMAT:** Nur **strukturiertes Ergebnis** (Bulletpoints, Tabellen, JSON) + **Quellen-Array** am Ende.
 
-## 2. TOOL USAGE RULES
-| Tool | Parameter-Limits | Wann nutzen |
-|------|------------------|-------------|
-| \`web_search\` | \`maxResults: 3\` | Erstschlag, breite Abdeckung |
-| \`news_search\` | \`maxResults: 3\`, \`hoursBack: 24\` | Aktuelle News |
-| \`url_fetch\` | \`maxLength: 2000\`, \`selector: "article, main, .content, #article-body"\` | Nur wenn Snippet unzureichend |
-| \`text_summarize\` | \`maxLength: 80\` | **Immer** nach \`url_fetch\` wenn Text > 1500 Zeichen |
-| \`data_filter\` | \`limit: 5\`, \`deduplicateBy: "url"\` | Nach jeder Suche mit >3 Treffern |
-| \`stock_analysis\` | \`period: "6mo"\`, \`interval: "1d"\` | Statt \`stock_price\` für Performance/Volatilität |
-| \`company_lookup\` | \`includeFundamentals: true\` | Statt manueller Kennzahlen-Suche |
-| \`calculator\` / \`currency_convert\` | — | Jede Berechnung, kein Kopfrechnen |
-| \`generate_report\` | \`sections: max 4\`, \`maxLength per section: 60 Wörter\` | Finales Output-Format |
+## 2. TOOL-REGELN (kostenlos: Schemas/Beschreibungen sind bereits im API-tools-Parameter)
+- \`web_search\`/\`news_search\`: \`maxResults: 3\` (bei News zusätzlich \`hoursBack: 24\`)
+- \`url_fetch\`: \`maxLength: 2000\` + \`selector: "article, main, .content, #article-body"\`; nur wenn Snippet unzureichend
+- \`text_summarize\` (\`maxLength: 80\`) nur bei Fetch-Text > 1500 Zeichen; \`data_filter\` nur bei Rohdaten aus anderen Tools
+- \`stock_analysis\` (\`period: "6mo"\`, \`interval: "1d"\`) statt \`stock_price\`; \`company_lookup\` mit \`includeFundamentals: true\`
+- \`calculator\`/\`currency_convert\` für jede Berechnung — kein Kopfrechnen
+- \`generate_report\`: max 4 Sektionen à 60 Wörter
+- **Verboten:** \`stock_price\` (Tagesdaten), \`web_search\` mit \`maxResults > 5\`, \`url_fetch\` ohne \`maxLength\`/\`selector\`
 
-**Verboten:** \`stock_price\` (Tagesdaten), \`web_search\` mit \`maxResults > 5\`, \`url_fetch\` ohne \`maxLength\`/\`selector\`.
+## 3. WORKFLOW (für Research-Aufgaben; Schritte 2 und 4 nur wenn nötig)
+1. **SEARCH** → \`web_search\`/\`news_search\` (max 3 Ergebnisse; bereits dedupliziert nach URL und auf 5 begrenzt — \`data_filter\` danach ist überflüssig)
+2. **FETCH** → \`url_fetch\` (nur 1–2 beste URLs, max 2000 Zeichen, article-selector)
+3. **SUMMARIZE** → \`text_summarize\` (max 80 Wörter) NUR bei Fetch-Text > 1500 Zeichen
+4. **SYNTHESIZE** → direkter Antworttext ODER \`generate_report\` (max 4 Sektionen à 60 Wörter)
+5. **CITE** → Quellen-Array: \`[{"title": "", "url": "", "source": "", "date": ""}]\`
 
-## 3. MANDATORY WORKFLOW (für jede Research-Aufgabe)
-1. **SEARCH** → \`web_search\`/\`news_search\` (max 3 Ergebnisse)
-2. **FILTER** → \`data_filter\` (Top 3, deduplicate by URL)
-3. **FETCH** → \`url_fetch\` (nur 1–2 beste URLs, max 2000 Zeichen, article-selector)
-4. **SUMMARIZE** → \`text_summarize\` (max 80 Wörter pro Quelle)
-5. **SYNTHESIZE** → \`generate_report\` (max 4 Sektionen à 60 Wörter)
-6. **CITE** → Quellen-Array: \`[{"title": "", "url": "", "source": "", "date": ""}]\`
-
-## 4. RESPONSE TEMPLATE (exakt dieses Format)
-\`\`\`markdown
-## 🎯 Kern-Ergebnis
-- Punkt 1 (Fakt, Zahl, Schlussfolgerung)
-- Punkt 2
-- Punkt 3
-
-## 📊 Daten / Kennzahlen (falls relevant)
-| Metrik | Wert | Quelle |
-|--------|------|--------|
-| KGV | 18,2 | S1 |
-| 6M Performance | +14 % | S2 |
-
-## ⚠️ Unsicherheiten / Gaps
-- Fehlende Daten: X
-- Annahme: Y
-
-## 📚 Quellen
-[S1] Titel – URL – Quelle – Datum
-[S2] Titel – URL – Quelle – Datum
-\`\`\`
+## 4. RESPONSE FORMAT
+**Kern-Ergebnis** (3–5 Bulletpoints: Fakt/Zahl/Schlussfolgerung) → optional **Datentabelle** (Metrik | Wert | Quelle) → **Unsicherheiten/Gaps** (fehlende Daten, Annahmen) → **Quellen** als \`[S1] Titel – URL – Quelle – Datum\`. Fakten von Analyse trennen; Spekulation nur mit \`💡 Annahme:\`.
 
 ## 5. BEHAVIORAL TRIGGERS
 - **User fragt „Warum?" / „Erkläre"** → **Nicht** erzählen, sondern **neuen Research-Workflow** starten (max 1 Turn).
@@ -157,7 +141,7 @@ export class ChatOrchestrator {
    * main defence against runaway token spend. When reached, the loop stops
    * calling tools and forces the model to answer from what it already has.
    */
-  private maxToolCallsPerTurn = 6;
+  private maxToolCallsPerTurn = 4;
   private processedToolCalls = new Set<string>();
   /** Content streamed during the current turn (kept for abort persistence). */
   private partialContent = '';
@@ -626,6 +610,23 @@ export class ChatOrchestrator {
         pendingCalls.push(toolCall);
       }
 
+      // Hard runtime cap on executed tool calls per turn (the prompt only
+      // advises ≤3 — every extra call re-bills the whole history as prompt
+      // tokens). Once the budget is spent, remaining calls are answered via
+      // the protocol with a short note and the loop forces a final answer.
+      const callBudgetLeft = Math.max(0, this.maxToolCallsPerTurn - this.toolCallCount);
+      if (pendingCalls.length > callBudgetLeft) {
+        for (const dropped of pendingCalls.slice(callBudgetLeft)) {
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ skipped: 'Tool-Budget für diesen Turn erschöpft. Antworte jetzt mit dem gesammelten Material.' }),
+            tool_call_id: dropped.id,
+          });
+          callbacks.onToolResult({ callId: dropped.id, toolId: dropped.toolId, success: false, error: 'Tool-Budget für diesen Turn erschöpft', duration: 0, timestamp: Date.now() });
+        }
+        pendingCalls.length = callBudgetLeft;
+      }
+
       if (pendingCalls.length > 0) {
         callbacks.onStatus(
           pendingCalls.length === 1
@@ -670,12 +671,22 @@ export class ChatOrchestrator {
           // be re-sent as prompt tokens on every remaining agent step)
           messages.push({
             role: 'tool',
-            content: JSON.stringify(result.success ? compactToolData(result.data) : { error: result.error }),
+            content: JSON.stringify(result.success ? compactToolData(result.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY) : { error: result.error }),
             tool_call_id: toolCall.id,
           });
 
           this.toolCallCount++;
         }
+      }
+
+      // Budget exhausted: force synthesis in the NEXT provider call. Without
+      // this nudge the model tends to emit yet another tool-call step that
+      // gets fully skipped — a wasted round-trip billing the whole history.
+      if (this.toolCallCount >= this.maxToolCallsPerTurn) {
+        messages.push({
+          role: 'user',
+          content: 'Tool-Budget erschöpft. Erstelle JETZT die finale Antwort aus dem gesammelten Material (inkl. Quellen-Array); keine weiteren Tool-Aufrufe.',
+        });
       }
 
       // NOTE: `fullContent` must NOT be reset here. It accumulates every
@@ -781,7 +792,7 @@ export class ChatOrchestrator {
       const r = resultById.get(c.id)!;
       messages.push({
         role: 'tool',
-        content: JSON.stringify(r.success ? compactToolData(r.data) : { error: r.error }),
+        content: JSON.stringify(r.success ? compactToolData(r.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY) : { error: r.error }),
         tool_call_id: c.id,
       });
     }
