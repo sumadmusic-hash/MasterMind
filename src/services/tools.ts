@@ -1,5 +1,5 @@
 import type { ToolDefinition, ToolCall, ToolResult, Source } from '../types';
-import { getSettings } from './database';
+import { getSettings, addLog } from './database';
 
 // scheduler.ts statically imports this module (setExecutionOrigin). Use a
 // lazy dynamic import for the reverse direction so there is no ESM cycle.
@@ -49,6 +49,47 @@ export function isScheduledRunActive(): boolean {
  * over — burning TPM budget and tool steps. Returning a precise error with the
  * valid names lets the model self-correct on the very next step.
  */
+/**
+ * Coerce the JSON-ish values LLMs actually emit into the types declared in the
+ * tool schema. Models send numbers as strings (`"4"`), booleans as `"true"` /
+ * `"1"` / `"ja"`, and invent empty placeholders (`""`, `"null"`, `"none"`) for
+ * optional parameters. Without coercion every such call dies in validation and
+ * burns a retry step + TPM budget; with coercion the same call just works.
+ * Mutates and returns `args` (callers pass a shallow copy).
+ */
+export function coerceToolArguments(
+  inputSchema: Record<string, any>,
+  args: Record<string, any>
+): Record<string, any> {
+  const props = (inputSchema?.properties || {}) as Record<string, any>;
+  // Only touch declared properties — unknown keys must survive untouched so
+  // validateToolArguments can still reject invented parameters.
+  for (const name of Object.keys(args)) {
+    const spec = props[name];
+    if (!spec) continue;
+    const value = args[name];
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (spec?.type === 'number') {
+      // ""/"null"/"none" are placeholder noise → treat as absent (default applies).
+      if (trimmed === '' || /^(null|none|n\/a|-)$/i.test(trimmed)) { delete args[name]; continue; }
+      const n = Number(trimmed.replace(/[\s_]/g, '').replace(',', '.'));
+      if (Number.isFinite(n)) args[name] = n;
+    } else if (spec?.type === 'boolean') {
+      if (trimmed === '' || /^(null|none|n\/a|-)$/i.test(trimmed)) { delete args[name]; continue; }
+      if (/^(true|1|yes|ja)$/i.test(trimmed)) args[name] = true;
+      else if (/^(false|0|no|nein)$/i.test(trimmed)) args[name] = false;
+    } else if (spec?.type === 'string') {
+      // Empty placeholders for optional strings would trip the "missing/empty"
+      // required check or leak junk into the implementation — drop them.
+      if ((trimmed === '' || /^(null|none)$/i.test(trimmed)) && !(inputSchema?.required || []).includes(name)) {
+        delete args[name];
+      }
+    }
+  }
+  return args;
+}
+
 export function validateToolArguments(
   inputSchema: Record<string, any>,
   args: Record<string, any>
@@ -56,12 +97,14 @@ export function validateToolArguments(
   const problems: string[] = [];
   const props = (inputSchema?.properties || {}) as Record<string, any>;
   const required = (inputSchema?.required || []) as string[];
-  const known = Object.keys(props);
+  // O(1) membership instead of Array.includes inside the per-key loop — this
+  // runs on EVERY tool call in the agent loop.
+  const known = new Set(Object.keys(props));
 
   for (const key of Object.keys(args || {})) {
-    if (!known.includes(key)) {
+    if (!known.has(key)) {
       problems.push(
-        `Unbekannter Parameter "${key}". Erlaubte Parameter: ${known.join(', ') || 'keine'}.`
+        `Unbekannter Parameter "${key}". Erlaubte Parameter: ${[...known].join(', ') || 'keine'}.`
       );
     }
   }
@@ -80,8 +123,19 @@ export function validateToolArguments(
       const n = Number(value);
       if (!Number.isFinite(n)) problems.push(`Parameter "${name}" muss eine Zahl sein.`);
     }
-    if (Array.isArray(spec?.enum) && !spec.enum.includes(value)) {
-      problems.push(`Parameter "${name}" muss einer der Werte sein: ${spec.enum.join(', ')}.`);
+    if (spec?.type === 'boolean' && typeof value !== 'boolean') {
+      problems.push(`Parameter "${name}" muss ein Boolean sein (true/false).`);
+    }
+    if (Array.isArray(spec?.enum)) {
+      // Accept case-insensitive enum matches ("TECH" → "tech") instead of
+      // forcing a wasted retry round-trip on pure casing differences.
+      if (!spec.enum.includes(value)) {
+        const ci = typeof value === 'string'
+          ? spec.enum.find((e: any) => typeof e === 'string' && e.toLowerCase() === value.toLowerCase())
+          : undefined;
+        if (ci !== undefined) args[name] = ci;
+        else problems.push(`Parameter "${name}" muss einer der Werte sein: ${spec.enum.join(', ')}.`);
+      }
     }
   }
 
@@ -93,9 +147,13 @@ class ToolRegistry {
   private tools: Map<string, ToolDefinition> = new Map();
   private implementations: Map<string, (args: any) => Promise<any>> = new Map();
 
+  private resolveCache = new Map<string, string>();
+
   register(tool: ToolDefinition, implementation: (args: any) => Promise<any>): void {
     this.tools.set(tool.id, tool);
     this.implementations.set(tool.id, implementation);
+    // Near-miss resolution depends on the full tool set — drop the memo.
+    this.resolveCache.clear();
   }
 
   getTool(id: string): ToolDefinition | undefined {
@@ -124,6 +182,18 @@ class ToolRegistry {
 
   /** Map near-miss tool ids onto real tools (exact → normalized → legacy alias → unique substring). */
   private resolveToolId(id: string): string {
+    if (!id) return id;
+    // Memoized: execute()/getTool()/toggleTool() resolve the same handful of
+    // ids over and over, and the fallback path is O(#tools) with per-id regex
+    // work. Entries are invalidated whenever the registry changes (register()).
+    const cached = this.resolveCache.get(id);
+    if (cached !== undefined) return cached;
+    const resolved = this.computeResolveToolId(id);
+    this.resolveCache.set(id, resolved);
+    return resolved;
+  }
+
+  private computeResolveToolId(id: string): string {
     if (this.tools.has(id)) return id;
     const direct = [id.toLowerCase(), id.replace(/[-\s]/g, '_'), id.replace(/^get_|^fetch_|^lookup_/, ''), id.replace(/_$/, '')];
     for (const cand of direct) if (this.tools.has(cand)) return cand;
@@ -159,7 +229,7 @@ class ToolRegistry {
     const resolvedId = this.resolveToolId(call.toolId);
     if (resolvedId !== call.toolId) call = { ...call, toolId: resolvedId };
     const tool = this.tools.get(resolvedId);
-    
+
     if (!tool) {
       return {
         callId: call.id,
@@ -194,8 +264,13 @@ class ToolRegistry {
       };
     }
 
+    // Normalize LLM-emitted argument types BEFORE validation (see
+    // coerceToolArguments), on a copy so the caller's original call object
+    // (persisted in the chat history) stays untouched.
+    const args = coerceToolArguments(tool.inputSchema, { ...(call.arguments || {}) });
+
     // Schema validation before execution (see validateToolArguments).
-    const problems = validateToolArguments(tool.inputSchema, call.arguments || {});
+    const problems = validateToolArguments(tool.inputSchema, args);
     if (problems.length > 0) {
       return {
         callId: call.id,
@@ -211,10 +286,13 @@ class ToolRegistry {
     // signal too, so a user cancel during a long-running tool (search, fetch)
     // ends the call immediately instead of waiting for maxDuration.
     let unsubscribeAbort: (() => void) | undefined;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
-      // Timeout handling
+      // Timeout handling. The handle is cleared once the race settles — the
+      // previous version left a pending timer for up to maxDuration on EVERY
+      // call (needless timers when many tools run per turn / scheduler burst).
       const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error(`Tool timeout after ${tool.maxDuration}ms`)), tool.maxDuration);
+        timeoutHandle = setTimeout(() => reject(new Error(`Tool timeout after ${tool.maxDuration}ms`)), tool.maxDuration);
       });
 
       const abortPromise: Promise<never> | null = signal
@@ -228,22 +306,46 @@ class ToolRegistry {
         : null;
 
       const result = await Promise.race([
-        impl(call.arguments),
+        impl(args),
         timeoutPromise,
         ...(abortPromise ? [abortPromise] : []),
       ]);
       unsubscribeAbort?.();
-      
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+
+      // Enforce the declared per-tool data limit (README: "strict timeouts and
+      // data size limits"). An oversized payload would otherwise be re-sent as
+      // prompt tokens on EVERY subsequent agent step of the turn.
+      let data = result;
+      if (tool.maxDataSize > 0) {
+        try {
+          const json = JSON.stringify(data ?? null);
+          if (json && json.length > tool.maxDataSize) {
+            data = {
+              truncated: true,
+              originalSize: json.length,
+              limit: tool.maxDataSize,
+              note: 'Tool-Ausgabe war zu groß und wurde begrenzt. Eingrenzen (weniger Treffer, kürzerer Zeitraum, weniger Felder) und erneut aufrufen.',
+              preview: json.slice(0, Math.min(tool.maxDataSize, 2000)),
+            };
+          }
+        } catch {
+          // Circular/unserializable output: keep as-is — compactToolData still
+          // caps strings/arrays before the result reaches the model.
+        }
+      }
+
       return {
         callId: call.id,
         toolId: call.toolId,
         success: true,
-        data: result,
+        data,
         duration: Date.now() - startTime,
         timestamp: Date.now(),
       };
     } catch (err: any) {
       unsubscribeAbort?.();
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
       return {
         callId: call.id,
         toolId: call.toolId,
@@ -252,7 +354,29 @@ class ToolRegistry {
         duration: Date.now() - startTime,
         timestamp: Date.now(),
       };
+    } finally {
+      this.logSlowOrFailedCall(call.toolId, startTime);
     }
+  }
+
+  /**
+   * Fire-and-forget observability (docs gap "Observability"): slow runs and
+   * timeouts land in the app log (Dexie) so they are debuggable outside the
+   * chat transcript. Only calls that took at least half the tool's timeout
+   * are logged — normal fast calls never touch IndexedDB. addLog is guarded
+   * with .catch(): logging must never break or slow down a tool call.
+   */
+  private logSlowOrFailedCall(toolId: string, startTime: number): void {
+    const duration = Date.now() - startTime;
+    const tool = this.tools.get(toolId);
+    const maxDuration = tool?.maxDuration ?? 15000;
+    if (duration < maxDuration / 2) return;
+    addLog({
+      level: duration >= maxDuration ? 'warn' : 'info',
+      message: `Tool ${toolId}: langer Lauf (${duration} ms)${duration >= maxDuration ? ' — Timeout erreicht?' : ''}`,
+      context: { toolId, duration },
+      timestamp: Date.now(),
+    }).catch(() => { /* IndexedDB nicht verfügbar (Tests) */ });
   }
 
   toggleTool(id: string, enabled: boolean): void {
