@@ -49,7 +49,7 @@ class SchedulerService {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = new Set<string>();
   /** Injected by AppContext so manual runs can be marked “user-initiated”. */
-  private markManual: (fn: () => void) => void = fn => fn();
+  private markManual: <T>(fn: () => T | Promise<T>) => T | Promise<T> = fn => fn();
 
   start(): void {
     if (this.timer) return;
@@ -161,6 +161,6 @@ class SchedulerService {
 export const schedulerService = new SchedulerService();
 
 /** Test hook: let suites drive the scheduler deterministically. */
-export function __setManualMarkerForTests(marker: (fn: () => void) => void): void {
+export function __setManualMarkerForTests(marker: <T>(fn: () => T | Promise<T>) => T | Promise<T>): void {
   schedulerService['markManual'] = marker;
 }
