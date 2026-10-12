@@ -272,7 +272,12 @@ export const toolRegistry = new ToolRegistry();
  * results (they count as prompt tokens on every subsequent agent step).
  * Strings are shortened, long arrays are capped; structure stays intact so
  * the model still sees all relevant fields.
+ * Ausnahme: das Feld `content` (siehe COMPACT_CONTENT_MAX) — Artikel-/Volltext-
+ * auszüge sind ein bewusst gesetztes Budget und dürfen nicht auf Snippet-Größe
+ * gestutzt werden, sonst erzwingen sie die teure url_fetch-Kaskade.
  */
+const COMPACT_CONTENT_MAX = 900;
+
 export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8): any {
   if (typeof data === 'string') {
     // Never truncate URLs — citations must stay complete and clickable.
@@ -289,6 +294,16 @@ export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8):
   if (data && typeof data === 'object') {
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(data)) {
+      // Sonderbehandlung "content": dieses Feld enthält die bewusst gesetzten
+      // Textauszüge der Tools (Webz-Volltext ~800 Z., url_fetch-Artikeltext).
+      // Die globale Stringkürzung würde sie auf Snippet-Größe stutzen und damit
+      // genau den Token-Spar-Effekt zunichtemachen (ohne Auszug → url_fetch +
+      // text_summarize als teure Kaskade). Für content gilt daher das eigene,
+      // bereits vom Tool gesetzte Budget — hier nur die harte Obergrenze.
+      if (k === 'content' && typeof v === 'string') {
+        out[k] = v.length > COMPACT_CONTENT_MAX ? v.slice(0, COMPACT_CONTENT_MAX) + '…' : v;
+        continue;
+      }
       out[k] = compactToolData(v, maxStringLen, maxArrayLen);
     }
     return out;
@@ -737,8 +752,24 @@ function webzDateFilter(hoursBack: number): string {
 /**
  * Mappt einen Webz-/api/news-Post (`posts[i]` mit eingebettetem `thread`)
  * auf das gemeinsame Source-Schema der App.
+ *
+ * Token-Sparen (Volltext statt Fetch-Kaskade): Webz.io liefert den Artikeltext
+ * bereits in `post.text`. Der Auszug wird deshalb je nach Modus unterschiedlich
+ * zugeschnitten — der Volltext ersetzt die Kaskade `url_fetch` +
+ * `text_summarize`, die pro Deep-Dive mehrere Hundert Prompt-Tokens kostet:
+ * - Standardmodus: ~800 Zeichen im Feld `content` — genug für eine Antwort
+ *   direkt aus dem Suchergebnis ("Tier-1: kein Fetch nötig").
+ * - Sparmodus (`includeContent: false`): nur ~300 Zeichen `snippet` und gar
+ *   kein `content`-Feld.
+ * WICHTIG: Das Ergebnis läuft zusätzlich durch `compactToolData` im
+ * Chat-Orchestrator (Stringkürzung auf 150 Zeichen pro Feld), bevor es als
+ * Prompt an das Modell geht. Ein langer `content` überlebt diese Kürzung nur,
+ * wenn er beim Parsen als URL/JSON-Feld erkennbar bleibt — tatsächlich wird
+ * auch er kompakt weitergereicht. Die Größen unten sind trotzdem bewusst
+ * gewählt: sie bestimmen, wie viel Informationsdichte vor der Kompaktierung
+ * erhalten bleibt (UI-Quellenliste, ResearchPage, Exporte lesen das Original).
  */
-function mapWebzHit(post: any): Source & { content?: string } {
+function mapWebzHit(post: any, contentChars = 800): Source & { content?: string } {
   const thread = post?.thread || {};
   const text = String(post?.text || '');
   // published ist ein ISO-Datum (z. B. "2026-10-09T16:40:00.000+03:00")
@@ -755,7 +786,7 @@ function mapWebzHit(post: any): Source & { content?: string } {
     sourceName: thread.site_title || thread.site || undefined,
     image: thread.main_image || undefined,
     categories: Array.isArray(thread.site_categories) ? thread.site_categories.slice(0, 5) : undefined,
-    content: text ? text.slice(0, 500) : undefined,
+    content: text ? text.slice(0, contentChars) : undefined,
   } as any;
 }
 
@@ -826,22 +857,24 @@ toolRegistry.register({
   description:
     'News-Recherche über die Webz.io-API (api.webz.io/api/news): globale Nachrichtenseiten inkl. ' +
     'deutscher Quellen, mit Kategorie-, Sprach- und Datumsfiltern. Liefert Titel, Quelle, '
-    + 'URL, Beschreibung/Volltextauszug und Datum. Bevorzugt bei aktuellen Nachrichten, ' +
+    + 'URL, ~800-Zeichen-Volltextauszug (content-Feld) und Datum — der Auszug reicht für ' +
+    'faktenbasierte Antworten DIREKT aus diesem Tool; url_fetch/text_summarize sind dann ' +
+    'überflüssig und kosten nur Tokens. Bevorzugt bei aktuellen Nachrichten, ' +
     'Marktentwicklungen und Themenbeobachtung. Benötigt das Webz.io-API-Token aus den Einstellungen.',
   category: 'data_source',
   inputSchema: {
     type: 'object',
     properties: {
       query: { type: 'string', description: 'Suchbegriff / Thema (z. B. "Bayer", "Inflation USA")' },
-      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 5, max 10)' },
-      hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 168 = 7 Tage)' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 3, max 10). Für Übersichten reichen 3.' },
+      hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 24; serverseitig via dateFilter gefiltert — nicht manuell nachfiltern)' },
       language: { type: 'string', description: 'Sprachfilter ISO-Code, z. B. "de" oder "en"' },
       category: {
         type: 'string',
         enum: ['business', 'tech', 'entertainment', 'politics', 'health', 'science', 'sports'],
         description: 'Optionale News-Kategorie',
       },
-      includeContent: { type: 'boolean', description: 'Auch Artikel-Volltext (gekürzt) zurückgeben' },
+      includeContent: { type: 'boolean', description: 'Volltextauszug (~800 Z.) zurückgeben (Standard true); false spart Tokens (nur 300-Z-Snippet)' },
     },
     required: ['query'],
   },
@@ -861,8 +894,11 @@ toolRegistry.register({
 }, async (args) => {
   // Token sparen: Ergebnisse werden als Prompt-Tokens bei jedem Agent-Schritt
   // erneut mitgesendet; kleine Defaults senken die Kosten ohne Qualitätsverlust.
-  const size = Math.min(Math.max(Number(args.maxResults) || 5, 1), 10);
-  const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 168, 1), 24 * 30);
+  // Standard 3 statt 5: für News-Übersichten reichen 3 Treffer (System-Prompt-Regel).
+  const size = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
+  // hoursBack ist bereits ein Server-seitiger Filter (dateFilter) — Default 24 h
+  // vermeidet teures manuelles Nachfiltern im Workflow.
+  const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 24, 1), 24 * 30);
 
   const data = await fetchWebzJson({
     q: String(args.query).trim(),
@@ -878,7 +914,7 @@ toolRegistry.register({
   });
 
   const posts: any[] = Array.isArray(data?.posts) ? data.posts : [];
-  let articles = dedupeByUrl(posts.map(mapWebzHit)).slice(0, size);
+  let articles = dedupeByUrl(posts.map(p => mapWebzHit(p))).slice(0, size);
   // includeContent=false spart Prompt-Tokens: Volltextauszüge wieder rausnehmen.
   if (args.includeContent === false) {
     articles = articles.map(({ content, ...rest }: any) => rest);
@@ -904,7 +940,8 @@ toolRegistry.register({
   description:
     'Top-/Überschriften-Überblick aus dem Webz.io-Korpus ohne Suchbegriff: die wichtigsten ' +
     'aktuellen Meldungen pro Kategorie (z. B. business, tech, politics), optional nach Sprache. ' +
-    'Ideal für Tagesübersichten wie "Was sind heute die wichtigsten Wirtschaftsnachrichten?".',
+    'Ideal für Tagesübersichten wie "Was sind heute die wichtigsten Wirtschaftsnachrichten?". ' +
+    'Tier-1-Werkzeug: Antwort direkt aus den mitgelieferten Auszügen, kein url_fetch nötig.',
   category: 'data_source',
   inputSchema: {
     type: 'object',
@@ -915,7 +952,7 @@ toolRegistry.register({
         description: 'News-Kategorie (Standard: business)',
       },
       language: { type: 'string', description: 'Sprachfilter ISO-Code, z. B. "de" oder "en"' },
-      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 5, max 10)' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 3, max 10). Für Übersichten reichen 3.' },
       hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 24)' },
     },
     required: [],
@@ -931,7 +968,8 @@ toolRegistry.register({
   maxDataSize: 50000,
   builtin: true,
 }, async (args) => {
-  const size = Math.min(Math.max(Number(args.maxResults) || 5, 1), 10);
+  // Token sparen: Standard 3 statt 5 Treffer; Übersichts-Turns brauchen keine 10 Artikel.
+  const size = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
   const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 24, 1), 24 * 30);
 
   const data = await fetchWebzJson({
@@ -947,7 +985,9 @@ toolRegistry.register({
   });
 
   const posts: any[] = Array.isArray(data?.posts) ? data.posts : [];
-  const articles = dedupeByUrl(posts.map(mapWebzHit)).slice(0, size);
+  // Top-News-Antworten entstehen meist direkt aus den Auszügen — 800 Z. content
+  // ersetzen hier den url_fetch-Schritt komplett (Tier-1-Regel im System-Prompt).
+  const articles = dedupeByUrl(posts.map(p => mapWebzHit(p))).slice(0, size);
 
   return {
     provider: 'webz.io',
