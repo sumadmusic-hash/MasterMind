@@ -87,6 +87,31 @@ export interface ChatOrchestratorCallbacks {
   onStatus: (status: string) => void;
 }
 
+/**
+ * Continuation instruction injected when the previous model refused the task
+ * and a fallback model takes over. It tells the new model to RESUME the task
+ * from the existing conversation state (including tool results already
+ * present in the message history) instead of redoing everything from scratch.
+ */
+const REFUSAL_RESUME_INSTRUCTION = `⚠️ FORTESETZUNGS-HINWEIS (Fallback-Übernahme):
+Das vorherige Modell hat diese Anfrage abgelehnt. Du übernimmst die Aufgabe AB DEM AKTUELLEN STAND:
+- Bereits ausgeführte Tool-Aufrufe und ihre Ergebnisse stehen im Gesprächsverlauf – nutze sie, führe keine identische Suche/Abfrage erneut aus.
+- Erstelle nichts neu, was bereits vorhanden ist; setze nur die noch offenen Schritte der Aufgabe fort.
+- Beantworte die ursprüngliche Nutzeranfrage mit dem gesammelten Material so vollständig wie möglich.`;
+
+/** Marker used to persist an interrupted turn so it can be resumed later. */
+const INTERRUPTED_SUFFIX = 'Prozess angehalten';
+
+/** Silent callback set used when a caller (e.g. tests) doesn't need UI events. */
+const NOOP_CALLBACKS: ChatOrchestratorCallbacks = {
+  onToken: () => {},
+  onToolCall: () => {},
+  onToolResult: () => {},
+  onComplete: () => {},
+  onError: () => {},
+  onStatus: () => {},
+};
+
 export class ChatOrchestrator {
   private abortController: AbortController | null = null;
   private toolCallCount = 0;
@@ -94,12 +119,17 @@ export class ChatOrchestrator {
   private processedToolCalls = new Set<string>();
   /** Content streamed during the current turn (kept for abort persistence). */
   private partialContent = '';
+  /**
+   * Set after a refusal/interruption so the NEXT provider call receives the
+   * "continue, don't restart" instruction exactly once.
+   */
+  private pendingResumeNote = false;
 
   async sendMessage(
     settings: AppSettings,
     session: ChatSession,
-    userMessage: string,
-    callbacks: ChatOrchestratorCallbacks
+    userMessage?: string,
+    callbacks: ChatOrchestratorCallbacks = NOOP_CALLBACKS
   ): Promise<void> {
     this.abortController = new AbortController();
     this.toolCallCount = 0;
@@ -107,16 +137,28 @@ export class ChatOrchestrator {
     this.maxToolSteps = settings.maxToolSteps;
 
     // Add user message (via immutable helper so React state updates and the
-    // final persistence below always see the same, up-to-date session)
-    this.appendMessage(session, {
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: userMessage,
-      timestamp: Date.now(),
-    });
+    // final persistence below always see the same, up-to-date session).
+    // `userMessage` is optional: resumeTurn() reuses the existing session as-is.
+    if (userMessage !== undefined) {
+      this.appendMessage(session, {
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: userMessage,
+        timestamp: Date.now(),
+      });
+    }
 
     try {
-      await this.runAgentLoop(settings, session, callbacks);
+      const loop = await this.runAgentLoop(settings, session, callbacks);
+      // If the turn stopped because every model refused (or all failed), the
+      // interruption is persisted WITH the completed work attached — a later
+      // resumeTurn() continues from there instead of restarting the task.
+      if (loop?.interruption) {
+        this.persistInterruptedTurn(session, loop.interruption.err, loop.interruption.ctx);
+        await saveChatSession(session);
+        callbacks.onError(loop.interruption.err.message || 'An error occurred');
+        await addLog({ level: 'error', message: `Chat error: ${loop.interruption.err.message}`, timestamp: Date.now() });
+      }
     } catch (err: any) {
       if (err.name === 'AbortError') {
         // Persist what was streamed so far — previously an abort discarded the
@@ -133,20 +175,90 @@ export class ChatOrchestrator {
         callbacks.onStatus('Aborted by user');
         return;
       }
-      // Budget-wait failures must not discard progress either: persist the
-      // partial turn (user message, streamed text, completed tool steps) so a
-      // retry can build on it instead of starting over.
+      // Interruptions outside the agent loop must not discard progress either:
+      // persist the partial turn so a retry can build on it.
       if (this.partialContent.trim().length > 0) {
         this.appendMessage(session, {
           id: crypto.randomUUID(),
           role: 'assistant',
-          content: this.partialContent + `\n\n*(Prozess angehalten: ${err.message || 'Fehler'})*`,
+          content: this.partialContent + `\n\n*(${INTERRUPTED_SUFFIX}: ${err.message || 'Fehler'})*`,
           timestamp: Date.now(),
         });
         await saveChatSession(session);
       }
       callbacks.onError(err.message || 'An error occurred');
       await addLog({ level: 'error', message: `Chat error: ${err.message}`, timestamp: Date.now() });
+    }
+
+    await saveChatSession(session);
+  }
+
+  /**
+   * Resume the LAST interrupted turn of a session — e.g. after a model refused
+   * the request and the fallback chain took over, or after a TPM-budget wait
+   * failed. Instead of re-asking the user and redoing every completed step,
+   * this continues from the persisted state: finished agent steps and their
+   * tool results are replayed into the provider context for free, and only the
+   * remaining work is executed by the (fallback) model.
+   */
+  async resumeTurn(
+    settings: AppSettings,
+    session: ChatSession,
+    callbacks: ChatOrchestratorCallbacks = NOOP_CALLBACKS
+  ): Promise<void> {
+    this.abortController = new AbortController();
+    this.toolCallCount = 0;
+    this.processedToolCalls = new Set();
+    this.maxToolSteps = settings.maxToolSteps;
+
+    const last = session.messages[session.messages.length - 1];
+    if (!last || last.role !== 'assistant' || !last.content.includes(INTERRUPTED_SUFFIX)) {
+      throw new Error('Kein angehaltener Turn gefunden – es gibt nichts fortzusetzen.');
+    }
+
+    // Strip the interruption marker from the persisted partial answer so the
+    // continuation flows seamlessly onto exactly the point where the previous
+    // attempt stopped.
+    const stripped = last.content.replace(/\n\n*\(\*[^)]*\)\*$/, '').trim();
+    last.content = stripped ? `${stripped}\n\n*(Fortsetzung nach Fallback-Übernahme)*` : '';
+    session.messages = [...session.messages];
+    session.updatedAt = Date.now();
+
+    // The fallback model that takes over must CONTINUE the task instead of
+    // restarting it — injected once into the very next provider call.
+    this.pendingResumeNote = true;
+
+    try {
+      const loop = await this.runAgentLoop(settings, session, callbacks);
+      if (loop?.interruption) {
+        this.persistInterruptedTurn(session, loop.interruption.err, loop.interruption.ctx);
+        callbacks.onError(loop.interruption.err.message || 'An error occurred');
+        await addLog({ level: 'error', message: `Resume error: ${loop.interruption.err.message}`, timestamp: Date.now() });
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        if (this.partialContent.trim().length > 0) {
+          this.appendMessage(session, {
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: this.partialContent + '\n\n*(Antwort abgebrochen)*',
+            timestamp: Date.now(),
+          });
+        }
+        await saveChatSession(session);
+        callbacks.onStatus('Aborted by user');
+        return;
+      }
+      if (this.partialContent.trim().length > 0) {
+        this.appendMessage(session, {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: this.partialContent + `\n\n*(${INTERRUPTED_SUFFIX}: ${err.message || 'Fehler'})*`,
+          timestamp: Date.now(),
+        });
+      }
+      callbacks.onError(err.message || 'An error occurred');
+      await addLog({ level: 'error', message: `Resume error: ${err.message}`, timestamp: Date.now() });
     }
 
     await saveChatSession(session);
@@ -170,7 +282,7 @@ export class ChatOrchestrator {
     settings: AppSettings,
     session: ChatSession,
     callbacks: ChatOrchestratorCallbacks
-  ): Promise<void> {
+  ): Promise<{ interruption?: { err: any; ctx: Parameters<ChatOrchestrator['persistInterruptedTurn']>[2] } } | void> {
     const messages = this.buildProviderMessages(session.messages);
     const tools = toolRegistry.getToolDefinitionsForLLM();
     // Accumulates the FINAL answer text across steps. Previously it was reset
@@ -182,6 +294,10 @@ export class ChatOrchestrator {
     let currentModel = '';
     let currentProvider = '';
     let totalTokens = 0;
+    // Text of every COMPLETED step of this turn (steps that ended with tool
+    // calls). Kept separately so an interrupted turn can be persisted with all
+    // progress and resumed without regenerating earlier output.
+    const stepContents: string[] = [];
     // Sources are collected across ALL steps of the turn and deduplicated by
     // URL — models often run the same search in several steps, which
     // previously produced duplicated citation lists in the final message.
@@ -209,12 +325,26 @@ export class ChatOrchestrator {
     // prompt tokens for the duplicated results.
     const seenToolSignatures = new Set<string>();
 
+    // Replay completed work from a previously interrupted turn: if the last
+    // assistant message is an interruption marker that carries tool calls AND
+    // their results (persisted before), feed them straight back into the
+    // provider context. The fallback model then continues where the refused
+    // attempt stopped — instead of re-running every search/tool from scratch.
+    this.seedInterruptedProgress(messages, session.messages);
+
     // Agent loop: keep calling until no more tool calls or max steps reached
     for (let step = 0; step < this.maxToolSteps; step++) {
       callbacks.onStatus(step === 0 ? 'Thinking...' : `Processing step ${step + 1}...`);
 
       let assistantContent = '';
       let toolCalls: any[] = [];
+
+      // Refusal/fallback takeover: tell the new model ONCE to resume the task
+      // from the existing state rather than restarting it.
+      if (this.pendingResumeNote) {
+        messages.push({ role: 'user', content: REFUSAL_RESUME_INSTRUCTION });
+        this.pendingResumeNote = false;
+      }
 
       try {
         const result = await callProvider(
@@ -246,6 +376,22 @@ export class ChatOrchestrator {
               callbacks.onStatus(
                 `Token-Limit erreicht – warte auf Budget (${secs}s${waited > 0 ? `, wartet seit ${waited}s` : ''})…`
               );
+            },
+            // Fallback takeover DURING this request: a previous model failed or
+            // refused and the next one streams into the SAME UI buffer. Reset
+            // the per-attempt buffers so the refusing model's partial text is
+            // not prepended to the fallback model's answer ("weitermachen,
+            // nicht doppelt"), and track which model is now answering.
+            onModelSwitch: (modelId, provider, attempt) => {
+              if (attempt > 1) {
+                assistantContent = '';
+                this.partialContent = '';
+                callbacks.onStatus(
+                  `Modell hat abgelehnt/fehler → Fallback übernimmt (${provider}/${modelId}), Aufgabe wird fortgesetzt…`
+                );
+              }
+              currentModel = modelId;
+              currentProvider = provider;
             },
           },
           this.abortController?.signal
@@ -281,6 +427,14 @@ export class ChatOrchestrator {
         callbacks.onComplete(finalMessage);
         callbacks.onStatus('Complete');
         return;
+      }
+
+      // The model asked for tools: its planning text is now a completed step
+      // of THIS turn. Keep it as the base of the final answer — previously it
+      // was discarded here, so after an interruption/fallback takeover only the
+      // last step's text survived and earlier output had to be produced again.
+      if (assistantContent.trim().length > 0) {
+        fullContent += (fullContent ? '\n\n' : '') + assistantContent;
       }
 
       // Process tool calls. Assign a stable unique id to every call FIRST and
@@ -407,7 +561,8 @@ export class ChatOrchestrator {
       fullContent = '';
     }
 
-    // Max steps reached
+    // Max steps reached — persist the tool activity too, so a later resume or
+    // follow-up can build on the completed research instead of redoing it.
     const finalMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'assistant',
@@ -417,10 +572,90 @@ export class ChatOrchestrator {
       provider: currentProvider,
       tokensUsed: totalTokens,
       sources: sources.length > 0 ? sources : undefined,
+      toolCalls: turnToolCalls.length > 0 ? turnToolCalls : undefined,
+      toolResults: turnToolResults.length > 0 ? turnToolResults : undefined,
     };
     this.appendMessage(session, finalMessage);
     callbacks.onComplete(finalMessage);
     callbacks.onStatus('Max steps reached');
+  }
+
+  /**
+   * Persist an interrupted turn (refusal / budget exhaustion) together with
+   * the work already done in that turn, so `resumeTurn()` (or any later retry)
+   * can CONTINUE from this state instead of restarting the task from scratch.
+   */
+  private persistInterruptedTurn(
+    session: ChatSession,
+    err: any,
+    ctx: {
+      partialContent: string;
+      stepContents: string[];
+      turnToolCalls: ToolCall[];
+      turnToolResults: ToolResult[];
+      sources: Source[];
+      model: string;
+      provider: string;
+      tokens: number;
+    }
+  ): void {
+    const refusal = err?.refusal === true || err?.name === 'ModelRefusalError';
+    const body = [
+      ...ctx.stepContents.map(c => c.trim()).filter(Boolean),
+      ctx.partialContent.trim(),
+    ].filter(Boolean).join('\n\n');
+    const note = refusal
+      ? `Alle Modelle haben die Anfrage abgelehnt bzw. kein Ergebnis geliefert: ${err.message}`
+      : `Prozess angehalten: ${err?.message || 'Fehler'}`;
+    this.appendMessage(session, {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: `${body ? body + '\n\n' : ''}*(${INTERRUPTED_SUFFIX}: ${note})*`,
+      timestamp: Date.now(),
+      model: ctx.model || undefined,
+      provider: ctx.provider || undefined,
+      tokensUsed: ctx.tokens || undefined,
+      sources: ctx.sources.length > 0 ? ctx.sources : undefined,
+      toolCalls: ctx.turnToolCalls.length > 0 ? ctx.turnToolCalls : undefined,
+      toolResults: ctx.turnToolResults.length > 0 ? ctx.turnToolResults : undefined,
+    });
+  }
+
+  /**
+   * Replay completed work of an interrupted turn into the provider message
+   * list. The last assistant message carrying the interruption marker keeps
+   * its tool calls/results; feeding them back as assistant+tool messages means
+   * the fallback model sees exactly how far the task had progressed and only
+   * performs the remaining steps — nothing already researched is executed or
+   * generated again.
+   */
+  private seedInterruptedProgress(messages: ProviderMessage[], chatMessages: ChatMessage[]): void {
+    const last = chatMessages[chatMessages.length - 1];
+    if (!last || last.role !== 'assistant') return;
+    if (!last.content.includes(INTERRUPTED_SUFFIX)) return;
+    if (!last.toolCalls?.length || !last.toolResults?.length) return;
+
+    const resultById = new Map(last.toolResults.map(r => [r.id, r]));
+    const usable = last.toolCalls.filter(c => resultById.has(c.id));
+    if (usable.length === 0) return;
+
+    messages.push({
+      role: 'assistant',
+      content: '',
+      tool_calls: usable.map(c => ({
+        id: c.id,
+        type: 'function',
+        function: { name: c.toolName, arguments: JSON.stringify(c.arguments ?? {}) },
+      })),
+    });
+    for (const c of usable) {
+      const r = resultById.get(c.id)!;
+      messages.push({
+        role: 'tool',
+        content: JSON.stringify(r.success ? compactToolData(r.data) : { error: r.error }),
+        tool_call_id: c.id,
+      });
+    }
   }
 
   private buildProviderMessages(chatMessages: ChatMessage[]): ProviderMessage[] {
