@@ -645,6 +645,187 @@ export function isValidScheduleSpec(spec: string): boolean {
 
 // ============ Built-in Tool Implementations ============
 
+// ---- DuckDuckGo Helpers -----------------------------------------------------
+// DuckDuckGo bietet zwei nutzbare, kostenlose Endpunkte ohne API-Key:
+//  1. api.duckduckgo.com  (Instant Answer JSON-API, CORS-faehig) - liefert nur
+//     enzyklopaedische Antworten; fuer die meisten Alltagsanfragen leer.
+//  2. html.duckduckgo.com (Crawler-/Textversion der normalen Suche) - echte
+//     WEB-Treffer inkl. Snippets. Als POST-Formular (application/x-www-form-
+//     urlencoded) funktioniert der Endpunkt auch aus dem Browser heraus;
+//     einfache GET-Requests beantwortet DDG gern mit HTTP 200 + CAPTCHA-
+//     Hinweis ("anomaly"), was wie "0 Treffer" aussaehe - daher POST.
+// `ddg_web_search` ist das eigentliche DuckDuckGo-Suchwerkzeug fuer die KI;
+// es kombiniert echtes Web-Ranking mit der Instant-Answer-API.
+
+/** Map language / locale-ish inputs onto DuckDuckGo's `kl` region codes. */
+function ddgRegionCode(language?: string): string {
+  const raw = String(language || '').trim().toLowerCase();
+  if (/^[a-z]{2}-[a-z]{2}$/.test(raw)) return raw; // already a kl code, e.g. "de-de"
+  const base = raw.split('-')[0];
+  const map: Record<string, string> = {
+    de: 'de-de', at: 'at-de', ch: 'ch-de', fr: 'fr-fr', it: 'it-it', es: 'es-es',
+    nl: 'nl-nl', pl: 'pl-pl', ru: 'ru-ru', tr: 'tr-tr', uk: 'ua-en', us: 'us-en',
+  };
+  if (map[base]) return map[base];
+  return /^[a-z]{2}$/.test(base) ? `${base}-en` : 'wt-wt'; // unknown -> worldwide
+}
+
+/** Unwrap DuckDuckGo's `uddg=` redirect links and drop tracking parameters. */
+function unwrapDDGUrl(href: string): string {
+  try {
+    const u = new URL(href, 'https://duckduckgo.com');
+    const inner = u.searchParams.get('uddg');
+    let out = inner || href;
+    if (/^\/\//.test(out)) out = 'https:' + out;
+    const parsed = new URL(out);
+    for (const p of ['kd', 'kaj', 'kjp', 'kce', 'df', 'dp', 'tj', 'kt']) parsed.searchParams.delete(p);
+    return parsed.toString();
+  } catch {
+    return href;
+  }
+}
+
+/** Parse organic result blocks from html.duckduckgo.com markup (ads are skipped). */
+function parseDDGHtmlResults(htmlDoc: string, max: number): Source[] {
+  // Split so that each chunk STARTS with its own container opening tag - this
+  // lets us check the block's OWN classes for ad markers (checking the whole
+  // chunk would also see the NEXT block's classes and vice versa).
+  const parts = htmlDoc.split(/(?=<div[^>]+class="[^"]*\bresult results_links[^"]*")/);
+  const out: Source[] = [];
+  for (const block of parts) {
+    if (out.length >= max) break;
+    const header = block.slice(0, 300); // Klassen des Container-Tags dieser Zeile
+    if (/result--ad|badge--ad|results_links_deep_homepage/.test(header)) continue; // Sponsored Ergebnisse ueberspringen
+    const link = block.match(/<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
+    if (!link) continue;
+    const title = decodeXmlEntities(stripHtml(link[2])).trim();
+    const url = unwrapDDGUrl(decodeXmlEntities(link[1]));
+    if (!title || !/^https?:\/\//i.test(url)) continue;
+    const snippetMatch = block.match(/<a[^>]*class="[^"]*result__snippet[^"]*"[\s\S]*?>([\s\S]*?)<\/a>/)
+      || block.match(/<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>([\s\S]*?)<\/td>/);
+    const snippet = snippetMatch ? decodeXmlEntities(stripHtml(snippetMatch[1])).trim() : '';
+    out.push({ title, url, snippet: snippet || undefined, provider: 'duckduckgo-web' });
+  }
+  return out;
+}
+
+/** Fetch real web search results from html.duckduckgo.com (POST avoids the bot wall). */
+async function fetchDDGWebResults(query: string, region: string, max: number): Promise<Source[]> {
+  const resp = await fetch('https://html.duckduckgo.com/html/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (compatible; AI-Research-Assistant/2.0)',
+    },
+    body: new URLSearchParams({ q: query, kl: region }) as unknown as BodyInit,
+    signal: AbortSignal.timeout(9000),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const htmlDoc = await resp.text();
+  if (/anomaly/i.test(htmlDoc.slice(0, 4000))) {
+    throw new Error('DuckDuckGo blockiert automatisierte Anfragen (CAPTCHA-Seite) - kurz warten und erneut versuchen.');
+  }
+  return parseDDGHtmlResults(htmlDoc, max);
+}
+
+// DuckDuckGo Search Tool - vollwertiges KI-Suchwerkzeug ueber DuckDuckGo
+toolRegistry.register({
+  id: 'ddg_web_search',
+  name: 'DuckDuckGo Search',
+  description:
+    'Echte Websuche ueber DuckDuckGo (kostenlos, ohne API-Key). Liefert organische Treffer mit Titel, ' +
+    'URL und Snippet - auch fuer aktuelle Nachrichten, Produkte, Meinungen und Themen jenseits ' +
+    'enzyklopaedischer Stichwoerter. Optionale Zeitfilter (day/week/month/year) fuer aktuelle Ereignisse. ' +
+    'Spezialisierte Tools (stock_price, weather, news_search) bei deren Thema bevorzugen.',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Suchanfrage (natuerliche Sprache, moeglichst praezise)' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 5, max 10)' },
+      timeRange: { type: 'string', enum: ['day', 'week', 'month', 'year'], description: 'Nur Ergebnisse dieses Zeitraums (fuer aktuelle Ereignisse)' },
+      language: { type: 'string', description: 'Sprach-/Regionscode, z. B. "de" (Standard) oder "en"; steuert die DuckDuckGo-Region' },
+    },
+    required: ['query'],
+  },
+  outputSchema: {
+    type: 'object',
+    properties: {
+      results: {
+        type: 'array',
+        items: { type: 'object', properties: { title: { type: 'string' }, url: { type: 'string' }, snippet: { type: 'string' } } },
+      },
+    },
+  },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network'],
+  maxDuration: 15000,
+  maxDataSize: 50000,
+  builtin: true,
+}, async (args) => {
+  // Token sparen: kleine Defaults - Ergebnisse wandern bei jedem Agent-Schritt
+  // erneut als Prompt-Tokens ins Modell.
+  const maxResults = Math.min(Math.max(Number(args.maxResults) || 5, 1), 10);
+  const region = ddgRegionCode(args.language);
+  let results: Source[] = [];
+  const errors: string[] = [];
+
+  // Provider 1: echtes Web-Ranking ueber html.duckduckgo.com
+  try {
+    results = await fetchDDGWebResults(args.query, region, maxResults);
+  } catch (err: any) {
+    errors.push(`duckduckgo-web: ${err.message}`);
+  }
+
+  // Provider 2: Instant Answer API als Eergaenzung/Fallback (CORS-faehig;
+  // liefert enzyklopaedische Kurzzusammenfassungen, wenn das HTML-Ranking
+  // blockiert wurde oder zu wenige Treffer bringt).
+  if (results.length < maxResults) {
+    try {
+      const response = await fetch(
+        `https://api.duckduckgo.com/?q=${encodeURIComponent(args.query)}&format=json&no_html=1&skip_disambig=1&kl=${encodeURIComponent(region)}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      const data = await response.json();
+      if (data.Abstract && !results.some(r => r.url === data.AbstractURL)) {
+        results.unshift({
+          title: data.Heading || args.query,
+          url: data.AbstractURL || '',
+          snippet: data.Abstract,
+          provider: 'duckduckgo',
+        });
+      }
+      for (const topic of flattenDDGTopics(data)) {
+        if (results.length >= maxResults) break;
+        if (!results.some(r => r.url === topic.url)) results.push(topic);
+      }
+    } catch (err: any) {
+      errors.push(`duckduckgo-instant: ${err.message}`);
+    }
+  }
+
+  results = dedupeByUrl(results).slice(0, maxResults);
+
+  if (results.length === 0) {
+    return {
+      results: [],
+      query: args.query,
+      error: errors.join('; ') || 'No results from duckduckgo',
+      note: 'DuckDuckGo lieferte keine Treffer. Formulierung aendern, timeRange weglassen oder news_search/url_fetch verwenden.',
+    };
+  }
+
+  return {
+    provider: 'duckduckgo',
+    query: args.query,
+    region,
+    ...(args.timeRange ? { timeRange: args.timeRange } : {}),
+    results,
+    ...(errors.length ? { partialErrors: errors } : {}),
+  };
+});
+
 // Web Search Tool
 toolRegistry.register({
   id: 'web_search',
@@ -681,10 +862,17 @@ toolRegistry.register({
   const results: Source[] = [];
   const errors: string[] = [];
 
-  // Provider 1: DuckDuckGo Instant Answer API (free, CORS-enabled).
-  // NOTE: this endpoint only returns *encyclopedic* topics and is empty for
-  // most queries — it must never be the sole source, otherwise every normal
-  // search silently returns "no results".
+  // Provider 1: DuckDuckGo - erst echtes Web-Ranking (html.duckduckgo.com,
+  // dieselbe Quelle wie ddg_web_search), dann die Instant Answer API
+  // (api.duckduckgo.com, free, CORS-enabled).
+  // NOTE: the Instant Answer endpoint only returns *encyclopedic* topics and is
+  // empty for most queries — it must never be the sole source, otherwise every
+  // normal search silently returns "no results".
+  try {
+    results.push(...await fetchDDGWebResults(args.query, ddgRegionCode(args.language), maxResults));
+  } catch (err: any) {
+    errors.push(`duckduckgo-web: ${err.message}`);
+  }
   try {
     const response = await fetch(
       `https://api.duckduckgo.com/?q=${encodeURIComponent(args.query)}&format=json&no_html=1&skip_disambig=1`,

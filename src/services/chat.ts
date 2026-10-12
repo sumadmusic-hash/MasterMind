@@ -28,7 +28,7 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 - **OUTPUT FORMAT:** Nur **strukturiertes Ergebnis** (Bulletpoints, Tabellen, JSON) + **Quellen-Array** am Ende.
 
 ## 2. TOOL-REGELN (kostenlos: Schemas/Beschreibungen sind bereits im API-tools-Parameter)
-- \`web_search\`/\`news_search\`: \`maxResults: 3\` (bei News zusätzlich \`hoursBack: 24\`)
+- \`ddg_web_search\`/\`web_search\`/\`news_search\`: \`maxResults: 3\` (bei News zusätzlich \`hoursBack: 24\`); \`ddg_web_search\` ist die DuckDuckGo-Websuche mit echten Suchergebnissen (Option \`timeRange: day/week/month/year\` für aktuelle Ereignisse)
 - \`url_fetch\`: \`maxLength: 2000\` + \`selector: "article, main, .content, #article-body"\`; nur wenn Snippet unzureichend
 - \`text_summarize\` (\`maxLength: 80\`) nur bei Fetch-Text > 1500 Zeichen; \`data_filter\` nur bei Rohdaten aus anderen Tools
 - \`stock_analysis\` (\`period: "6mo"\`, \`interval: "1d"\`) statt \`stock_price\`; \`company_lookup\` mit \`includeFundamentals: true\`
@@ -38,7 +38,7 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 - **Verboten:** \`stock_price\` für Research-Berichte (nur Tagesdaten; für Einzelabfragen aktueller Kurse/Indizes ist \`stock_price\` dagegen das richtige Tool), \`web_search\` mit \`maxResults > 5\`, \`url_fetch\` ohne \`maxLength\`/\`selector\`
 
 ## 3. WORKFLOW (für Research-Aufgaben; Schritte 2 und 4 nur wenn nötig)
-1. **SEARCH** → \`web_search\`/\`news_search\` (max 3 Ergebnisse; bereits dedupliziert nach URL und auf 5 begrenzt — \`data_filter\` danach ist überflüssig)
+1. **SEARCH** → \`ddg_web_search\`/\`web_search\`/\`news_search\` (max 3 Ergebnisse; bereits dedupliziert nach URL und auf 5 begrenzt — \`data_filter\` danach ist überflüssig)
 2. **FETCH** → \`url_fetch\` (nur 1–2 beste URLs, max 2000 Zeichen, article-selector)
 3. **SUMMARIZE** → \`text_summarize\` (max 80 Wörter) NUR bei Fetch-Text > 1500 Zeichen
 4. **SYNTHESIZE** → direkter Antworttext ODER \`generate_report\` (max 4 Sektionen à 60 Wörter)
