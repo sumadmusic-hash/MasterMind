@@ -10,7 +10,33 @@ interface Reservation {
 class TokenPerMinuteManager {
   private budget: TokenBudget;
   private reservations: Map<string, Reservation> = new Map();
+  /**
+   * Provider-Index über die usageLog: erlaubt das Bilden der Pro-Provider-
+   * Nutzung in O(n) statt O(anbieter × n) und bleibt bei jedem Eintrag
+   * exakt synchron (alle Mutationen laufen über die privaten Helfer unten).
+   */
+  private usageByProvider = new Map<string, { tokens: number; timestamp: number }[]>();
   private usageLog: { provider: string; tokens: number; timestamp: number }[] = [];
+
+  /** Sole mutation point for usageLog entries — keeps the index in sync. */
+  private pushUsage(provider: string, tokens: number, timestamp: number): void {
+    const entry = { provider, tokens, timestamp };
+    this.usageLog.push(entry);
+    let list = this.usageByProvider.get(provider);
+    if (!list) { list = []; this.usageByProvider.set(provider, list); }
+    list.push(entry);
+  }
+
+  /** Replace the whole usage log (window pruning/reset) and rebuild the index. */
+  private setUsageLog(entries: { provider: string; tokens: number; timestamp: number }[]): void {
+    this.usageLog = entries;
+    this.usageByProvider.clear();
+    for (const e of entries) {
+      let list = this.usageByProvider.get(e.provider);
+      if (!list) { list = []; this.usageByProvider.set(e.provider, list); }
+      list.push(e);
+    }
+  }
   private windowMs = 60000; // 60 seconds
   // Lightweight change notification so the UI can re-render ONLY when the
   // displayed budget numbers actually changed (instead of a fixed 2s poll
@@ -43,10 +69,9 @@ class TokenPerMinuteManager {
    * the oldest in-flight entries to age out and re-check.
    */
   private estimateWaitMs(tokens: number): number {
-    // usageLog is a plain array — iterate it directly (Map-style `.values()`
-    // on an array yields the *index keys* "0","1",… as strings, so every
-    // `entry.tokens` below was undefined and the estimate silently degraded
-    // to a fixed full-window wait).
+    // usageLog is a plain array — iterate it directly. (Entries are pushed in
+    // chronological order already, but sorting keeps the estimate correct even
+    // if that ever changes.)
     const inflight = [...this.usageLog].sort((a, b) => a.timestamp - b.timestamp);
     if (inflight.length === 0) return this.windowMs;
     // Walk oldest-first until enough tokens would be freed by aging out
@@ -178,7 +203,7 @@ class TokenPerMinuteManager {
     if (budgetChanged) {
       this.reservations.clear();
       this.budget.reserved = 0;
-      this.usageLog = [];
+      this.setUsageLog([]);
       this.budget.usedInWindow = 0;
       this.budget.windowStart = Date.now();
       for (const provider of Object.keys(this.budget.perProvider)) {
@@ -196,12 +221,12 @@ class TokenPerMinuteManager {
     // every call (windowStart > timestamps of retained entries).
     const cutoff = now - this.windowMs;
 
-    // Clean old usage entries
-    this.usageLog = this.usageLog.filter(u => u.timestamp >= cutoff);
+    // Clean old usage entries (single pass; rebuilds the provider index once)
+    this.setUsageLog(this.usageLog.filter(u => u.timestamp >= cutoff));
 
     // Recalculate
     this.budget.usedInWindow = this.usageLog.reduce((sum, u) => sum + u.tokens, 0);
-    
+
     // Clean expired reservations (older than 30 seconds)
     for (const [id, res] of this.reservations) {
       if (now - res.timestamp > 30000) {
@@ -209,13 +234,25 @@ class TokenPerMinuteManager {
         this.budget.reserved -= res.tokens;
       }
     }
-    
-    // Recalculate per-provider usage
+
+    // Recalculate per-provider usage via the provider index — one O(n) pass
+    // over the log total, instead of filtering+reducing the full log once per
+    // configured provider (this ran on every reserve()/getBudget() call).
     for (const provider of Object.keys(this.budget.perProvider)) {
-      this.budget.perProvider[provider].used = this.usageLog
-        .filter(u => u.provider === provider)
-        .reduce((sum, u) => sum + u.tokens, 0);
+      const entries = this.usageByProvider.get(provider);
+      let used = 0;
+      if (entries) for (const e of entries) used += e.tokens;
+      this.budget.perProvider[provider].used = used;
     }
+  }
+
+  /** Sum of currently pending reservations for a provider (O(reservations)). */
+  private reservedForProvider(provider: string): number {
+    let sum = 0;
+    for (const res of this.reservations.values()) {
+      if (res.provider === provider) sum += res.tokens;
+    }
+    return sum;
   }
 
   /**
@@ -241,11 +278,7 @@ class TokenPerMinuteManager {
     // Check per-provider limit (include pending reservations for this provider)
     const providerLimit = this.budget.perProvider[provider];
     if (providerLimit) {
-      let reservedForProvider = 0;
-      for (const res of this.reservations.values()) {
-        if (res.provider === provider) reservedForProvider += res.tokens;
-      }
-      const providerTotal = providerLimit.used + reservedForProvider + tokens;
+      const providerTotal = providerLimit.used + this.reservedForProvider(provider) + tokens;
       if (providerTotal > providerLimit.limit) {
         return null;
       }
@@ -258,13 +291,20 @@ class TokenPerMinuteManager {
 
     // Reserve
     const id = crypto.randomUUID();
+    const now = Date.now();
     this.reservations.set(id, {
       id,
       provider,
       tokens,
-      timestamp: Date.now(),
+      timestamp: now,
     });
     this.budget.reserved += tokens;
+    // The reservation itself already blocks the budget. Only once real usage
+    // is recorded (recordUsage) an entry enters the window — pushing one here
+    // would pre-load usedInWindow with a value that gets REPLACED by the real
+    // (usually larger) usage later, so it never made the accounting more
+    // conservative; it just inflated the displayed usage and effectively cut
+    // the usable TPM budget roughly in half under load.
     this.notifyIfChanged();
 
     return id;
@@ -277,11 +317,7 @@ class TokenPerMinuteManager {
    * 30s expiry cleanup kicked in — throttling the budget far too aggressively.
    */
   recordUsage(provider: string, tokens: number, reservationId?: string): void {
-    this.usageLog.push({
-      provider,
-      tokens,
-      timestamp: Date.now(),
-    });
+    this.pushUsage(provider, tokens, Date.now());
 
     if (reservationId) {
       const res = this.reservations.get(reservationId);
@@ -350,7 +386,7 @@ class TokenPerMinuteManager {
    * are kept so in-flight requests stay accounted for.
    */
   clearWindow(): void {
-    this.usageLog = [];
+    this.setUsageLog([]);
     this.budget.usedInWindow = 0;
     this.budget.windowStart = Date.now();
     for (const provider of Object.keys(this.budget.perProvider)) {

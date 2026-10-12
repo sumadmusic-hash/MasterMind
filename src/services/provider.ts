@@ -1,5 +1,5 @@
 import type { ModelConfig, ChatMessage, TokenUsage, AppSettings } from '../types';
-import { recordTokenUsage } from './database';
+import { recordTokenUsage, addLog } from './database';
 import { tpmManager } from './tpm';
 
 export interface ProviderMessage {
@@ -167,9 +167,25 @@ export async function callProvider(
   // "all models declined" apart from "all models errored" — and must NOT treat
   // a refusal as a reason to re-run work that was already completed.
   let sawRefusal = false;
+  // Config errors (e.g. "Unknown provider") are thrown synchronously by
+  // getApiUrl for EVERY slot that references the same broken provider string.
+  // Retrying them against all 7 fallbacks just repeats the identical failure
+  // and hides the real cause behind a generic final error — fail fast instead.
+  const seenConfigErrors = new Set<string>();
 
   for (let attemptIdx = 0; attemptIdx < modelConfigs.length; attemptIdx++) {
     const config = modelConfigs[attemptIdx];
+    let apiUrl: string;
+    try {
+      apiUrl = getApiUrl(config.provider);
+    } catch (err: any) {
+      lastError = err;
+      if (!seenConfigErrors.has(err.message)) {
+        seenConfigErrors.add(err.message);
+        await addLog({ level: 'warn', message: `Provider-Konfiguration: ${err.message}`, timestamp: Date.now() });
+      }
+      continue;
+    }
     const apiKey = getApiKey(settings, config.provider);
     if (!apiKey) {
       lastError = new Error(`API key not configured for ${config.provider}`);
@@ -204,7 +220,7 @@ export async function callProvider(
       }
 
       const result = await executeProviderCall(
-        config, apiKey, messages, tools, callbacks, abortSignal, settings
+        config, apiKey, apiUrl, messages, tools, callbacks, abortSignal, settings
       );
 
       // Refusal check: the call technically succeeded (HTTP 200) but the model
@@ -285,13 +301,17 @@ export async function callProvider(
 async function executeProviderCall(
   config: ModelConfig,
   apiKey: string,
+  url: string,
   messages: ProviderMessage[],
   tools: any[] | undefined,
   callbacks: StreamCallbacks | undefined,
   abortSignal: AbortSignal | undefined,
   settings: AppSettings
 ): Promise<{ content: string; usage: TokenUsage }> {
-  const url = getApiUrl(config.provider);
+  // NOTE: the request URL is resolved by the caller (callProvider) BEFORE the
+  // TPM reservation — an unknown provider must fail fast without ever
+  // reserving/consuming budget. Previously getApiUrl ran here, after the
+  // reservation was already made.
   
   const body: any = {
     model: config.modelId,
