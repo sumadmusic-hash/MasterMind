@@ -350,7 +350,10 @@ export class ChatOrchestrator {
     // Deduplicate tool calls by (name + arguments): models often repeat the
     // exact same call across steps, which wastes both execution time and
     // prompt tokens for the duplicated results.
-    const seenToolSignatures = new Set<string>();
+    // NOTE: this is a Map signature -> real call id, NOT a plain Set: when an
+    // identical call was already executed, the skip message must still be
+    // keyed to the CURRENT call's protocol id (see the dedup branch below).
+    const seenToolSignatures = new Map<string, string>();
     // One retry is allowed when a model returns a completely empty reply
     // (no text, no tools) before anything was accomplished this turn.
     let emptyRetryUsed = false;
@@ -533,6 +536,9 @@ export class ChatOrchestrator {
       // stock, URL fetch) previously ran one after another, so a step with
       // several calls took the SUM of their latencies instead of the maximum.
       const pendingCalls: ToolCall[] = [];
+      // Duplicate calls detected in this step; their tool messages are pushed
+      // after the parallel execution so they can replay the real result.
+      const deferredDedupReplies: { callId: string; signature: string }[] = [];
 
       for (const { raw: tc, id: preallocatedId } of resolvedToolCalls) {
         const callId = preallocatedId;
@@ -595,16 +601,24 @@ export class ChatOrchestrator {
 
         // Skip identical tool calls already executed in this turn; return the
         // cached result to the model so the tool-call protocol stays valid.
+        // The signature maps to the id of the call that PRODUCED the result,
+        // so a duplicate gets the original answer back instead of just a
+        // "was returned earlier" hint the model cannot act on — that hint
+        // made many models re-issue the same call anyway (the dedup only
+        // saved execution time, not prompt tokens). Replaying the compacted
+        // result costs nothing extra and lets the model proceed immediately.
         const signature = `${toolName}:${JSON.stringify(toolArgs)}`;
-        if (seenToolSignatures.has(signature)) {
-          messages.push({
-            role: 'tool',
-            content: JSON.stringify({ skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }),
-            tool_call_id: callId,
-          });
+        const priorCallId = seenToolSignatures.get(signature);
+        if (priorCallId !== undefined) {
+          // The producing call may still be running IN PARALLEL inside this
+          // very step (its result isn't in turnToolResults yet). Push the tool
+          // message AFTER the results loop instead, so the duplicate always
+          // gets the real cached replay — never a bare "returned earlier"
+          // hint that models tend to answer by re-issuing the same call.
+          deferredDedupReplies.push({ callId, signature });
           continue;
         }
-        seenToolSignatures.add(signature);
+        seenToolSignatures.set(signature, callId);
 
         callbacks.onToolCall(toolCall);
         pendingCalls.push(toolCall);
@@ -626,6 +640,14 @@ export class ChatOrchestrator {
         }
         pendingCalls.length = callBudgetLeft;
       }
+
+      // Protocol invariant: EVERY tool_call in the assistant message needs a
+      // matching tool message. Invalid/duplicate/budget-skipped calls got
+      // theirs immediately; deferred duplicates and executed calls are next —
+      // build all replies first, then push in ORIGINAL call order so the
+      // assistant tool_calls and tool messages stay aligned (Groq rejects
+      // out-of-order tool responses with a 400).
+      const stepToolMessages: ProviderMessage[] = [];
 
       if (pendingCalls.length > 0) {
         callbacks.onStatus(
@@ -669,7 +691,7 @@ export class ChatOrchestrator {
 
           // Add tool result to messages (compacted: raw results would otherwise
           // be re-sent as prompt tokens on every remaining agent step)
-          messages.push({
+          stepToolMessages.push({
             role: 'tool',
             content: JSON.stringify(result.success ? compactToolData(result.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY) : { error: result.error }),
             tool_call_id: toolCall.id,
@@ -678,6 +700,29 @@ export class ChatOrchestrator {
           this.toolCallCount++;
         }
       }
+
+      // Deferred duplicates: the producing call ran in parallel within THIS
+      // step (or earlier), so its result is available by now — replay it
+      // instead of a bare hint. Fallback note keeps the protocol valid even if
+      // the producing call itself failed before storing a result.
+      for (const dup of deferredDedupReplies) {
+        const priorCallId = seenToolSignatures.get(dup.signature);
+        const priorResult = priorCallId ? turnToolResults.find(r => r.callId === priorCallId) : undefined;
+        stepToolMessages.push({
+          role: 'tool',
+          content: JSON.stringify(
+            priorResult
+              ? { ...(priorResult.success
+                    ? compactToolData(priorResult.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY)
+                    : { error: priorResult.error }),
+                 note: 'identical call skipped – cached result from earlier in this turn' }
+              : { skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }
+          ),
+          tool_call_id: dup.callId,
+        });
+      }
+
+      messages.push(...stepToolMessages);
 
       // Budget exhausted: force synthesis in the NEXT provider call. Without
       // this nudge the model tends to emit yet another tool-call step that
