@@ -45,8 +45,8 @@ export default defineConfig({
     proxy: {
       // Webz.io News API (https://app.webz.io/): api.webz.io sendet keine
       // CORS-Headers, daher laufen die Browser-Fetches des webz_news-Tools
-      // über diesen Dev-Proxy. Pfad wird entfernt (/webz-api/search →
-      // https://api.webz.io/search). In Produktion durch eine eigene
+      // über diesen Dev-Proxy. Pfad wird entfernt (/webz-api/api/news →
+      // https://api.webz.io/api/news). In Produktion durch eine eigene
       // Proxy-Basis in den Settings (webzApiBaseUrl) ersetzen.
       '/webz-api': {
         target: 'https://api.webz.io',

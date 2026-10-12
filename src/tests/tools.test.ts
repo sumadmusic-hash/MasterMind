@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { toolRegistry } from '../services/tools';
 
 describe('ToolRegistry', () => {
@@ -156,6 +156,59 @@ describe('ToolRegistry', () => {
     });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Webz\.io-API-Token/i);
+  });
+
+  // Regressionschutz für das offizielle Webz-"Integrate"-Snippet:
+  // GET https://api.webz.io/api/news?token=...&q=...&format=json (NICHT /search).
+  it('webz_news calls the /api/news endpoint with q param and maps posts correctly', async () => {
+    const fetchCalls: string[] = [];
+    const origFetch = globalThis.fetch;
+    (globalThis as any).fetch = async (url: any, init?: any) => {
+      fetchCalls.push(String(url));
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          posts: [{
+            url: 'https://example.com/a1',
+            title: 'Testmeldung',
+            text: 'Langertext des Artikels …',
+            published: '2026-10-09T16:40:00.000+03:00',
+            thread: { site: 'example.com', site_title: 'Example News', main_image: 'https://example.com/img.jpg' },
+          }],
+          total_results: 1,
+        }),
+      };
+    };
+    try {
+      // Token-Quelle mocken: getSettings ist ein ESM-Live-Binding — vitest kann es
+      // nicht zuweisen, aber mit spyOnProperty (Accessor) überschreiben.
+      const db = await import('../services/database');
+      // Vitest-eigener Mock-Setter (funktioniert bei ESM-Exporten), danach restore.
+      vi.spyOn(db, 'getSettings').mockResolvedValue({ webzApiToken: 'test-token' } as any);
+
+      let result: any;
+      try {
+        result = await toolRegistry.execute({
+          id: 't', toolId: 'webz_news', toolName: 'webz_news',
+          arguments: { query: 'Bayer' }, timestamp: Date.now(),
+        });
+      } finally {
+        vi.restoreAllMocks();
+      }
+
+      expect(result.success).toBe(true);
+      expect(fetchCalls[0]).toContain('/api/news?');
+      expect(fetchCalls[0]).toContain('q=Bayer');
+      expect(fetchCalls[0]).toContain('token=test-token');
+      const articles: any[] = (result.data as any).articles;
+      expect(articles[0].title).toBe('Testmeldung');
+      expect(articles[0].url).toBe('https://example.com/a1');
+      expect(articles[0].provider).toBe('webz:example.com');
+      expect(articles[0].sourceName).toBe('Example News');
+      expect((result.data as any).totalHits).toBe(1);
+    } finally {
+      (globalThis as any).fetch = origFetch;
+    }
   });
 
   describe('search tools regression (empty-result bug)', () => {
