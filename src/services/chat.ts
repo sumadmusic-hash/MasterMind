@@ -433,7 +433,10 @@ export class ChatOrchestrator {
         currentModel = result.model;
         currentProvider = result.provider;
         lastStepContent = result.content;
-        fullContent += result.content;
+        // NOTE: no accumulation here — the step's text is added to `fullContent`
+        // exactly once below (in the tool-step branch) or used directly as the
+        // final answer (no-tool-calls branch). Accumulating BOTH here and there
+        // duplicated every planning text in the final/persisted answer.
       } catch (err: any) {
         if (err.name === 'AbortError') throw err;
         // The whole fallback chain failed or refused. DON'T end the turn here
