@@ -226,3 +226,78 @@ export interface AppLog {
   context?: Record<string, any>;
   timestamp: number;
 }
+
+// ============ Memory / Portfolio / Scheduler Types (Phase 1+2) ============
+// Persistenter Nutzer-Kontext (`user_memory`), Positionen
+// (`portfolio_tracking`) und zeitgesteuerte Jobs (`scheduler`) — siehe
+// docs/fehlende-tools-mehr-macht.md. Alles rein clientseitig in IndexedDB.
+
+export type MemoryCategory = 'preference' | 'position' | 'watchlist' | 'fact';
+
+export interface MemoryEntry {
+  id: string;
+  /** Stable key within a category, e.g. ticker "SAP" or key "sprache". */
+  key: string;
+  category: MemoryCategory;
+  content: string;
+  importance: number; // 0..1 — used for recall ranking & prompt budgeting
+  pinned: boolean;    // pinned memories are always injected into the prompt
+  createdAt: number;
+  updatedAt: number;
+  lastAccessedAt?: number;
+}
+
+export interface PortfolioPosition {
+  id: string;
+  ticker: string;
+  name?: string;
+  quantity: number;
+  purchasePrice: number;
+  currency: string;
+  openedAt: number;
+  note?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Cached time series of `macro_series` (TTL-based, saves rate limits/tokens). */
+export interface TimeSeriesCacheEntry {
+  /** Cache key: `${source}:${seriesId}:${start}:${end}:${frequency}` */
+  id: string;
+  source: string;
+  seriesId: string;
+  fetchedAt: number;
+  expiresAt: number;
+  unit?: string;
+  observationDate?: string;
+  points: { date: string; value: number }[];
+}
+
+/** Result snapshot of one scheduler run (written by schedulerService). */
+export interface ScheduledRun {
+  id: string;
+  jobId: string;
+  startedAt: number;
+  finishedAt: number;
+  success: boolean;
+  output?: any;
+  error?: string;
+}
+
+/**
+ * A recurring job executed by the client-side scheduler. The browser must be
+ * open (documented limitation); missed runs are caught up once per day.
+ */
+export interface ScheduledJob {
+  id: string;
+  name: string;
+  /** Simple interval spec, NOT full cron: "@daily", "@hourly" or "<n>m|h|d". */
+  schedule: string;
+  workflowId?: string;
+  inputs?: Record<string, any>;
+  enabled: boolean;
+  lastRun?: number;
+  nextRun?: number;
+  consecutiveFailures: number;
+  createdAt: number;
+}
