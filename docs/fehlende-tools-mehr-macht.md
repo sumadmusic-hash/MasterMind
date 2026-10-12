@@ -57,7 +57,7 @@
    - Clientseitig: `setTimeout`-Tick beim App-Start + Catch-up-Logik („verpasste Jobs beim nächsten Öffnen ausführen"); klar dokumentierte Einschränkung: Browser muss offen sein. Optional später Notification-API als Alarm.
    - Beispiel-Use-Case aus dem Chat: „jeden Morgen 8 Uhr: EZB + DAX" = Workflow `economic_calendar` + `stock_price` + `generate_report` → Store als Session-Anhang.
 5. **`chart_generator`**
-   - Tool `render_chart`: Input `{type, series[]}` → Output Mermaid/Plotly-JSON, das `ChatPage` rendert (Chart-Lib lazy importiert, hält Bundle klein). Erlaubte Typen als Enum (keits Arbitrary-Code).
+   - Tool `render_chart`: Input `{type, series[]}` → Output Mermaid/Plotly-JSON, das `ChatPage` rendert (Chart-Lib lazy importiert, hält Bundle klein). Erlaubte Typen als Enum (kein Arbitrary Code).
 6. **Datei-Export/-Import**
    - `export_file`: CSV/JSON/PDF (jsPDF) → Browser-Download; `import_file`: CSV/JSON-Parsing → an `data_filter` andockbar. Permissions: `storage` only.
 
