@@ -14,6 +14,9 @@ export function SettingsPage() {
   
   const [showGroqKey, setShowGroqKey] = useState(false);
   const [showOpenRouterKey, setShowOpenRouterKey] = useState(false);
+  const [showWebzToken, setShowWebzToken] = useState(false);
+  const [testingWebz, setTestingWebz] = useState(false);
+  const [webzTestResult, setWebzTestResult] = useState<{ success: boolean; error?: string } | null>(null);
   const [testingProvider, setTestingProvider] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ provider: string; success: boolean; error?: string } | null>(null);
   const [advanced, setAdvanced] = useState(false);
@@ -40,6 +43,37 @@ export function SettingsPage() {
     const result = await testConnection(provider, apiKey, modelId);
     setTestResult({ provider, ...result });
     setTestingProvider(null);
+  };
+
+  // Verbindung zur Webz.io News API testen: Token gegen den echten Endpunkt
+  // validieren (über denselben Pfad wie das webz_news-Tool, inkl. Dev-Proxy).
+  const handleTestWebz = async () => {
+    setTestingWebz(true);
+    setWebzTestResult(null);
+    const token = String(settings.webzApiToken || '').trim();
+    if (!token) {
+      setWebzTestResult({ success: false, error: 'Kein Token eingetragen' });
+      setTestingWebz(false);
+      return;
+    }
+    try {
+      const base = String(settings.webzApiBaseUrl || '').trim().replace(/\/+$/, '') || '/webz-api';
+      const resp = await fetch(`${base}/search?${new URLSearchParams({ token, format: 'json', size: '1' })}`, {
+        signal: AbortSignal.timeout(12000),
+      });
+      if (resp.status === 401) throw new Error('Ungültiges Token (HTTP 401)');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json().catch(() => null);
+      if (!data || typeof data !== 'object') throw new Error('Keine JSON-Antwort (Proxy fehlt?)');
+      if (Array.isArray(data.hits)) {
+        setWebzTestResult({ success: true });
+      } else {
+        setWebzTestResult({ success: false, error: String(data?.error || data?.message || 'Unerwartetes Antwortformat') });
+      }
+    } catch (err: any) {
+      setWebzTestResult({ success: false, error: err.message || 'Verbindung fehlgeschlagen' });
+    }
+    setTestingWebz(false);
   };
 
   const handleClearData = async () => {
@@ -139,6 +173,45 @@ export function SettingsPage() {
                 <div className={`flex items-center gap-1 mt-1 text-xs ${testResult.success ? 'text-green-400' : 'text-red-400'}`}>
                   {testResult.success ? <Check className="w-3 h-3" /> : <X className="w-3 h-3" />}
                   {testResult.success ? 'Connection successful' : testResult.error}
+                </div>
+              )}
+            </div>
+
+            {/* Webz.io News API */}
+            <div>
+              <label className="text-sm text-gray-400 mb-1 block">Webz.io News API Token</label>
+              <div className="flex gap-2">
+                <div className="flex-1 relative">
+                  <input
+                    type={showWebzToken ? 'text' : 'password'}
+                    value={settings.webzApiToken || ''}
+                    onChange={e => updateSettings({ webzApiToken: e.target.value })}
+                    placeholder="Token aus https://app.webz.io/ (Dashboard → API)"
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    onClick={() => setShowWebzToken(!showWebzToken)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                  >
+                    {showWebzToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <button
+                  onClick={handleTestWebz}
+                  disabled={testingWebz}
+                  className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 transition-colors disabled:opacity-50"
+                >
+                  {testingWebz ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Für die KI-Tools „Webz.io News Search“ und „Webz.io Top News“. Requests laufen über den
+                Dev-Proxy /webz-api (bzw. eigene Proxy-Basis unten), da api.webz.io kein CORS erlaubt.
+              </p>
+              {webzTestResult && (
+                <div className={`flex items-center gap-1 mt-1 text-xs ${webzTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
+                  {webzTestResult.success ? <Check className="w-3 h-3" /> : <X className="w-3 h-3" />}
+                  {webzTestResult.success ? 'Connection successful' : webzTestResult.error}
                 </div>
               )}
             </div>
@@ -250,6 +323,22 @@ export function SettingsPage() {
 
           {advanced && (
             <div className="mt-4 space-y-4">
+              <div>
+                <label className="text-sm text-gray-400 mb-1 block">Webz.io Proxy-Basis (optional)</label>
+                <input
+                  type="text"
+                  value={settings.webzApiBaseUrl || ''}
+                  onChange={e => updateSettings({ webzApiBaseUrl: e.target.value })}
+                  placeholder="leer = /webz-api (Vite-Dev-Proxy)"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  api.webz.io sendet keine CORS-Headers. Für Produktions-Builds hier die Basis eines
+                  eigenen Proxys eintragen (z. B. https://proxy.example.de/webz), der Requests an
+                  https://api.webz.io weiterreicht.
+                </p>
+              </div>
+
               <div>
                 <label className="text-sm text-gray-400 mb-1 block">Max Tool Steps per Request</label>
                 <input

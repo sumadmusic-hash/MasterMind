@@ -14,6 +14,12 @@ export type ModelConfig = z.infer<typeof ModelConfigSchema>;
 export const AppSettingsSchema = z.object({
   groqApiKey: z.string().optional(),
   openRouterApiKey: z.string().optional(),
+  // Webz.io News API (https://app.webz.io/): Token für das webz_news-Tool.
+  // Wird nur lokal in IndexedDB gespeichert und direkt an api.webz.io gesendet.
+  webzApiToken: z.string().optional(),
+  // Optionale Basis-URL für Webz-Aufrufe (CORS-Proxy, z. B. eigener Backend-Proxy).
+  // Leer = Vite-Dev-Proxy /webz-api.
+  webzApiBaseUrl: z.string().optional(),
   primaryModel: ModelConfigSchema,
   // Fallback-Kette: bis zu 6 Modelle, der Reihe nach ausprobiert, wenn das
   // vorherige Modell fehlschlägt (Rate-Limit, Serverfehler, fehlender API-Key …).

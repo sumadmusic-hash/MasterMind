@@ -130,6 +130,34 @@ describe('ToolRegistry', () => {
     expect(tool?.inputSchema.required).toContain('location');
   });
 
+  // Webz.io News API (https://app.webz.io/) — als KI-Tools exponiert.
+  it('should have webz_news and webz_top_news tools registered', () => {
+    const search = toolRegistry.getTool('webz_news');
+    expect(search).toBeDefined();
+    expect(search?.category).toBe('data_source');
+    expect(search?.enabled).toBe(true);
+    expect(search?.inputSchema.required).toContain('query');
+
+    const top = toolRegistry.getTool('webz_top_news');
+    expect(top).toBeDefined();
+    expect(top?.inputSchema.properties.category.enum).toContain('business');
+
+    // Beide Tools müssen im LLM-Definitionen-Set auftauchen, damit das Modell
+    // sie überhaupt aufrufen kann.
+    const defs = toolRegistry.getToolDefinitionsForLLM();
+    expect(defs.some(d => d.name === 'webz_news')).toBe(true);
+    expect(defs.some(d => d.name === 'webz_top_news')).toBe(true);
+  });
+
+  it('webz_news fails with helpful error when no token is configured', async () => {
+    const result = await toolRegistry.execute({
+      id: 't', toolId: 'webz_news', toolName: 'webz_news',
+      arguments: { query: 'Test' }, timestamp: Date.now(),
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Webz\.io-API-Token/i);
+  });
+
   describe('search tools regression (empty-result bug)', () => {
     const exec = (toolId: string, args: any) =>
       toolRegistry.execute({ id: 't', toolId, toolName: toolId, arguments: args, timestamp: Date.now() });
