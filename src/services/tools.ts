@@ -433,7 +433,7 @@ export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8):
         continue;
       }
       // Sonderbehandlung "content": dieses Feld enthält die bewusst gesetzten
-      // Textauszüge der Tools (Webz-Volltext ~800 Z., url_fetch-Artikeltext).
+      // Textauszüge der Tools (url_fetch-Artikeltext).
       // Die globale Stringkürzung würde sie auf Snippet-Größe stutzen und damit
       // genau den Token-Spar-Effekt zunichtemachen (ohne Auszug → url_fetch +
       // text_summarize als teure Kaskade). Für content gilt daher das eigene,
@@ -764,18 +764,19 @@ toolRegistry.register({
   };
 });
 
-// News Search Tool
+// News Search Tool — nutzt ausschließlich die GNews.io-API (gnews_*-Tools unten).
+// Für News wird immer die GNews.io-API verwendet.
 toolRegistry.register({
   id: 'news_search',
   name: 'News Search',
-  description: 'Search for recent news articles. Returns titles, URLs, sources, and timestamps.',
+  description: 'Search for recent news articles via GNews.io (gnews.io). Returns titles, URLs, sources, and timestamps.',
   category: 'data_source',
   inputSchema: {
     type: 'object',
     properties: {
       query: { type: 'string', description: 'News search query' },
-      hoursBack: { type: 'number', description: 'How many hours back to search (default 48)' },
-      maxResults: { type: 'number', description: 'Maximum results (default 3, max 5)' },
+      language: { type: 'string', description: 'ISO code, e.g. "de" (default) or "en"' },
+      maxResults: { type: 'number', description: 'Maximum results (default 3, max 10)' },
     },
     required: ['query'],
   },
@@ -785,7 +786,7 @@ toolRegistry.register({
       articles: { type: 'array' }
     }
   },
-  version: '1.1.0',
+  version: '2.0.0',
   enabled: true,
   permissions: ['network'],
   maxDuration: 15000,
@@ -794,347 +795,22 @@ toolRegistry.register({
 }, async (args) => {
   // Token sparen: Ergebnisse werden als Prompt-Tokens bei jedem Agent-Schritt
   // erneut mitgesendet; kleine Defaults senken die Kosten ohne Qualitätsverlust.
-  const maxResults = Math.min(Math.max(Number(args.maxResults) || 3, 1), 5);
-  const hoursBack = args.hoursBack || 48;
-  const errors: string[] = [];
-
-  // RSS feeds are the only free news endpoints that work from the browser
-  // without an API key. They are tried in order until enough fresh items exist.
-  const q = encodeURIComponent(args.query);
-  const feeds = [
-    `https://news.google.com/rss/search?q=${q}&hl=de&gl=DE&ceid=DE:de`,
-    `https://www.bing.com/news/search?q=${q}&format=rss`,
-  ];
-
-  let articles: any[] = [];
-  for (const url of feeds) {
-    try {
-      const resp = await fetch(url, {
-        headers: { Accept: 'application/rss+xml, application/xml, text/xml' },
-        signal: AbortSignal.timeout(8000),
-      });
-      if (!resp.ok) { errors.push(`${new URL(url).host}: HTTP ${resp.status}`); continue; }
-      const parsed = parseRss(await resp.text(), new URL(url).host);
-      if (parsed.length === 0) { errors.push(`${new URL(url).host}: no items`); continue; }
-      articles = mergeArticles(articles, parsed);
-      if (articles.length >= maxResults) break;
-    } catch (err: any) {
-      errors.push(`${new URL(url).host}: ${err.message}`);
-    }
-  }
-
-  // Recency filter (best effort: keep everything if no dates could be parsed)
-  const cutoff = Date.now() - hoursBack * 3600 * 1000;
-  const dated = articles.filter(a => a.publishedAt && !Number.isNaN(Date.parse(a.publishedAt)));
-  if (dated.length > 0) {
-    const fresh = dated.filter(a => Date.parse(a.publishedAt) >= cutoff);
-    articles = (fresh.length > 0 ? fresh : dated).sort(
-      (a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)
-    );
-  } else {
-    articles = articles.slice(0, maxResults);
-  }
-
-  return {
-    articles: dedupeByUrl(articles).slice(0, maxResults),
-    query: args.query,
-    hoursBack,
-    ...(articles.length === 0 && errors.length ? { error: errors.join('; ') } : {}),
-  };
-});
-
-// ============ Webz.io News API (https://app.webz.io/) ============
-//
-// Nutzung der API (Stand: Okt. 2026, am offiziellen "Integrate"-Beispiel
-// aus dem Webz-Dashboard live verifiziert):
-// - Endpunkt:    GET https://api.webz.io/api/news?token=<TOKEN>&format=json&q=...
-//   (Achtung: der Pfad lautet "/api/news" — "/search" und "/api/search" liefern 404)
-// - Auth:        Token als Query-Parameter, kein OAuth/Header. Das Token gibt es
-//                nach Registrierung im Dashboard: https://app.webz.io/ (API-Token-Seite).
-//                Ungültiges Token → HTTP 401 {"detail":"Unknown API token"} (JSON).
-// - Parameter:   q (Suchanfrage; "*" = alles — dann besser sort=crawled),
-//                size (1..100, Standard 10), page (Seitennummerierung),
-//                sort=crawled|date|relevance, ts (Zeitstempel für Historie),
-//                dateFilter ("Today"/"Last2Days"/"Last7Days"/"Last30Days") bzw.
-//                dateFrom/dateTo (YYYY-MM-DD), language (ISO 639-1, z. B. "de"),
-//                category (z. B. business/tech/politics), author, title,
-//                relatedToUuid, bookmarkName, includeSyndicated (bool),
-//                allowNewsHistory (bool), webz_reporter (bool), format=json|rss|xml.
-// - Antwort:     { posts: [{ thread: { url, site, site_title, site_categories,
-//                title, published (ISO-Datum), site_type, country, main_image },
-//                url, title, text (Artikeltext), author, published, ... }],
-//                next, total_results, more_results_available, balance, cost, warnings }
-// - CORS:        api.webz.io sendet KEINE Access-Control-Allow-Origin-Headers; ein
-//                direkter Browser-Fetch wird daher vom Browser blockiert. Lösung:
-//                Requests laufen über den Vite-Dev-Proxy (/webz-api → api.webz.io)
-//                bzw. eine konfigurierbare Proxy-Basis (Settings: webzApiBaseUrl).
-
-/** Basis-URL für Webz-Aufrufe: Dev-Proxy, konfigurierbare Proxy-Basis oder direkt. */
-async function getWebzBaseUrl(): Promise<string> {
-  try {
-    const settings = await getSettings();
-    const custom = String(settings?.webzApiBaseUrl || '').trim().replace(/\/+$/, '');
-    if (custom) return custom;
-  } catch { /* IndexedDB nicht verfügbar (Tests) → Default-Proxy */ }
-  // /webz-api ist im Vite-Dev-Server als Rewrite-Proxy auf https://api.webz.io definiert.
-  return '/webz-api';
-}
-
-function webzDateFilter(hoursBack: number): string {
-  if (hoursBack <= 24) return 'Today';
-  if (hoursBack <= 48) return 'Last2Days';
-  if (hoursBack <= 168) return 'Last7Days';
-  return 'Last30Days';
-}
-
-/**
- * Mappt einen Webz-/api/news-Post (`posts[i]` mit eingebettetem `thread`)
- * auf das gemeinsame Source-Schema der App.
- *
- * Token-Sparen (Volltext statt Fetch-Kaskade): Webz.io liefert den Artikeltext
- * bereits in `post.text`. Der Auszug wird deshalb je nach Modus unterschiedlich
- * zugeschnitten — der Volltext ersetzt die Kaskade `url_fetch` +
- * `text_summarize`, die pro Deep-Dive mehrere Hundert Prompt-Tokens kostet:
- * - Standardmodus: ~800 Zeichen im Feld `content` — genug für eine Antwort
- *   direkt aus dem Suchergebnis ("Tier-1: kein Fetch nötig").
- * - Sparmodus (`includeContent: false`): nur ~300 Zeichen `snippet` und gar
- *   kein `content`-Feld.
- * WICHTIG: Das Ergebnis läuft zusätzlich durch `compactToolData` im
- * Chat-Orchestrator (Stringkürzung auf 150 Zeichen pro Feld), bevor es als
- * Prompt an das Modell geht. Ein langer `content` überlebt diese Kürzung nur,
- * wenn er beim Parsen als URL/JSON-Feld erkennbar bleibt — tatsächlich wird
- * auch er kompakt weitergereicht. Die Größen unten sind trotzdem bewusst
- * gewählt: sie bestimmen, wie viel Informationsdichte vor der Kompaktierung
- * erhalten bleibt (UI-Quellenliste, ResearchPage, Exporte lesen das Original).
- */
-function mapWebzHit(post: any, contentChars = 800): Source & { content?: string } {
-  const thread = post?.thread || {};
-  const text = String(post?.text || '');
-  // published ist ein ISO-Datum (z. B. "2026-10-09T16:40:00.000+03:00")
-  const publishedRaw = post?.published || thread?.published;
-  const publishedDate = publishedRaw ? new Date(String(publishedRaw)) : null;
-  return {
-    title: String(post?.title || thread?.title || '(ohne Titel)'),
-    url: String(post?.url || thread?.url || ''),
-    snippet: text ? text.slice(0, 300) : String(thread?.section_title || ''),
-    publishedAt: publishedDate && !Number.isNaN(publishedDate.getTime())
-      ? publishedDate.toISOString()
-      : undefined,
-    provider: `webz:${thread.site || thread.site_full || 'unknown'}`,
-    sourceName: thread.site_title || thread.site || undefined,
-    image: thread.main_image || undefined,
-    categories: Array.isArray(thread.site_categories) ? thread.site_categories.slice(0, 5) : undefined,
-    content: text ? text.slice(0, contentChars) : undefined,
-  } as any;
-}
-
-async function fetchWebzJson(params: Record<string, string | number | boolean>): Promise<any> {
-  const settings = await getSettings().catch(() => null);
-  const token = String(settings?.webzApiToken || '').trim();
-  if (!token) {
-    throw new Error(
-      'Kein Webz.io-API-Token hinterlegt. Bitte unter Einstellungen → API Keys → "Webz.io News API Token" ' +
-      'das Token aus dem Dashboard (https://app.webz.io/) eintragen.'
-    );
-  }
-  const base = await getWebzBaseUrl();
-  // Offizielles Dashboard-Schema: GET {base}/api/news?token=...&format=json&q=...
-  const qs = new URLSearchParams({ token, format: 'json', ...toQueryParams(params) });
-  // `credentials: 'omit'` unterdrückt den HTTP-Basic-Auth-Dialog des Browsers:
-  // api.webz.io antwortet bei einem ungültigen Token mit HTTP 401 + Header
-  // `WWW-Authenticate: Basic realm="Unauthorized"`. Ohne diese Option interpretiert
-  // der Browser das als Aufforderung zu Benutzername/Passwort und zeigt eine
-  // Login-Maske — obwohl Webz.io gar keine Basic-Auth kennt, sondern nur das
-  // API-Token als Query-Parameter braucht. Mit 'omit' erhalten wir stattdessen
-  // die klare Fehlermeldung unten.
-  const resp = await fetch(`${base}/api/news?${qs}`, { signal: AbortSignal.timeout(10000), credentials: 'omit' });
-
-  if (resp.status === 401) {
-    // /api/news antwortet bei ungültigem Token mit JSON {"detail":"Unknown API token"}
-    throw new Error('Webz.io: ungültiges API-Token (HTTP 401 "Unknown API token"). Token in den Einstellungen prüfen (Dashboard: https://app.webz.io/ → API-Token). Es ist kein Benutzername/Passwort nötig.');
-  }
-  if (resp.status === 429) {
-    throw new Error('Webz.io: Rate-Limit erreicht (HTTP 429). Weniger/vorsichtigere Anfragen oder Plan-Quota prüfen.');
-  }
-  if (resp.status === 404) {
-    throw new Error('Webz.io: Endpunkt nicht gefunden (HTTP 404). Erwarteter Pfad: {Proxy}/api/news — Proxy-Konfiguration (webzApiBaseUrl / Vite-Dev-Proxy) prüfen.');
-  }
-  if (!resp.ok) {
-    throw new Error(`Webz.io: HTTP ${resp.status}`);
-  }
-  // Bei Proxy-/HTML-Fehlantworten (z. B. laufender Server ohne /webz-api-Proxy)
-  // liefert response.json() einen SyntaxError — als klare Meldung übersetzen.
-  let data: any;
-  try {
-    data = await resp.json();
-  } catch {
-    throw new Error(
-      'Webz.io: keine JSON-Antwort erhalten. Läuft die App ohne Dev-Proxy? ' +
-      'Entweder Vite-Dev-Server verwenden (Proxy /webz-api) oder in den Einstellungen ' +
-      'eine eigene Proxy-Basis (webzApiBaseUrl) angeben, da api.webz.io keine CORS-Headers sendet.'
-    );
-  }
-  if (typeof data === 'string' && /unknown api token/i.test(data)) {
-    throw new Error('Webz.io: ungültiges API-Token. Token im Dashboard (https://app.webz.io/) kontrollieren.');
-  }
-  return data;
-}
-
-function toQueryParams(params: Record<string, string | number | boolean>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && String(v) !== '') out[k] = String(v);
-  }
-  return out;
-}
-
-// Webz.io News Search Tool — keyword search over the global news corpus.
-toolRegistry.register({
-  id: 'webz_news',
-  name: 'Webz.io News Search',
-  description:
-    'News-Recherche über die Webz.io-API (api.webz.io/api/news): globale Nachrichtenseiten inkl. ' +
-    'deutscher Quellen, mit Kategorie-, Sprach- und Datumsfiltern. Liefert Titel, Quelle, '
-    + 'URL, ~800-Zeichen-Volltextauszug (content-Feld) und Datum — der Auszug reicht für ' +
-    'faktenbasierte Antworten DIREKT aus diesem Tool; url_fetch/text_summarize sind dann ' +
-    'überflüssig und kosten nur Tokens. Bevorzugt bei aktuellen Nachrichten, ' +
-    'Marktentwicklungen und Themenbeobachtung. Benötigt das Webz.io-API-Token aus den Einstellungen.',
-  category: 'data_source',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Suchbegriff / Thema (z. B. "Bayer", "Inflation USA")' },
-      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 3, max 10). Für Übersichten reichen 3.' },
-      hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 24; serverseitig via dateFilter gefiltert — nicht manuell nachfiltern)' },
-      language: { type: 'string', description: 'Sprachfilter ISO-Code, z. B. "de" oder "en"' },
-      category: {
-        type: 'string',
-        enum: ['business', 'tech', 'entertainment', 'politics', 'health', 'science', 'sports'],
-        description: 'Optionale News-Kategorie',
-      },
-      includeContent: { type: 'boolean', description: 'Volltextauszug (~800 Z.) zurückgeben (Standard true); false spart Tokens (nur 300-Z-Snippet)' },
-    },
-    required: ['query'],
-  },
-  outputSchema: {
-    type: 'object',
-    properties: {
-      articles: { type: 'array' },
-      totalHits: { type: 'number' },
-    },
-  },
-  version: '1.0.0',
-  enabled: true,
-  permissions: ['network'],
-  maxDuration: 15000,
-  maxDataSize: 50000,
-  builtin: true,
-}, async (args) => {
-  // Token sparen: Ergebnisse werden als Prompt-Tokens bei jedem Agent-Schritt
-  // erneut mitgesendet; kleine Defaults senken die Kosten ohne Qualitätsverlust.
-  // Standard 3 statt 5: für News-Übersichten reichen 3 Treffer (System-Prompt-Regel).
-  const size = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
-  // hoursBack ist bereits ein Server-seitiger Filter (dateFilter) — Default 24 h
-  // vermeidet teures manuelles Nachfiltern im Workflow.
-  const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 24, 1), 24 * 30);
-
-  const data = await fetchWebzJson({
-    q: String(args.query).trim(),
-    size,
-    sort: 'date',
-    dateFilter: webzDateFilter(hoursBack),
-    language: args.language,
-    category: args.category,
-    includeSyndicated: false,
-    // Ohne diesen Flag liefert /api/news nur die letzten ~30 Tage; mit ihm ist
-    // auch Historiensuche möglich (wie im offiziellen Dashboard-Snippet).
-    allowNewsHistory: true,
+  const max = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
+  const data = await fetchGnewsJson('search', {
+    q: args.query,
+    lang: args.language || 'de',
+    max,
   });
 
-  const posts: any[] = Array.isArray(data?.posts) ? data.posts : [];
-  let articles = dedupeByUrl(posts.map(p => mapWebzHit(p))).slice(0, size);
-  // includeContent=false spart Prompt-Tokens: Volltextauszüge wieder rausnehmen.
-  if (args.includeContent === false) {
-    articles = articles.map(({ content, ...rest }: any) => rest);
-  }
+  const articles = dedupeByUrl((data.articles || []).map(mapGnewsHit)).filter(a => a.title && a.url).slice(0, max);
 
   return {
+    provider: 'gnews.io',
     query: args.query,
-    provider: 'webz.io',
-    totalHits: typeof data?.total_results === 'number' ? data.total_results : posts.length,
-    tookMs: data?.took,
-    hoursBack,
+    language: args.language || 'de',
+    totalHits: typeof data.totalArticles === 'number' ? data.totalArticles : articles.length,
     articles,
-    ...(articles.length === 0
-      ? { note: 'Keine Treffer. Query umformulieren, groesseres Zeitfenster (hoursBack) oder language/category lockern.' }
-      : {}),
-  };
-});
-
-// Webz.io Top News Tool — trending headlines per category (no query needed).
-toolRegistry.register({
-  id: 'webz_top_news',
-  name: 'Webz.io Top News',
-  description:
-    'Top-/Überschriften-Überblick aus dem Webz.io-Korpus ohne Suchbegriff: die wichtigsten ' +
-    'aktuellen Meldungen pro Kategorie (z. B. business, tech, politics), optional nach Sprache. ' +
-    'Ideal für Tagesübersichten wie "Was sind heute die wichtigsten Wirtschaftsnachrichten?". ' +
-    'Tier-1-Werkzeug: Antwort direkt aus den mitgelieferten Auszügen, kein url_fetch nötig.',
-  category: 'data_source',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      category: {
-        type: 'string',
-        enum: ['business', 'tech', 'entertainment', 'politics', 'health', 'science', 'sports'],
-        description: 'News-Kategorie (Standard: business)',
-      },
-      language: { type: 'string', description: 'Sprachfilter ISO-Code, z. B. "de" oder "en"' },
-      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 3, max 10). Für Übersichten reichen 3.' },
-      hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 24)' },
-    },
-    required: [],
-  },
-  outputSchema: {
-    type: 'object',
-    properties: { articles: { type: 'array' } },
-  },
-  version: '1.0.0',
-  enabled: true,
-  permissions: ['network'],
-  maxDuration: 15000,
-  maxDataSize: 50000,
-  builtin: true,
-}, async (args) => {
-  // Token sparen: Standard 3 statt 5 Treffer; Übersichts-Turns brauchen keine 10 Artikel.
-  const size = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
-  const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 24, 1), 24 * 30);
-
-  const data = await fetchWebzJson({
-    // q="*" = gesamtes Korpus (offizielles Dashboard-Muster für "Top News"),
-    // sort=crawled liefert die gerade frisch eingetroffenen Meldungen.
-    q: '*',
-    size,
-    sort: 'crawled',
-    dateFilter: webzDateFilter(hoursBack),
-    category: args.category || 'business',
-    language: args.language,
-    includeSyndicated: false,
-  });
-
-  const posts: any[] = Array.isArray(data?.posts) ? data.posts : [];
-  // Top-News-Antworten entstehen meist direkt aus den Auszügen — 800 Z. content
-  // ersetzen hier den url_fetch-Schritt komplett (Tier-1-Regel im System-Prompt).
-  const articles = dedupeByUrl(posts.map(p => mapWebzHit(p))).slice(0, size);
-
-  return {
-    provider: 'webz.io',
-    category: args.category || 'business',
-    language: args.language || 'any',
-    hoursBack,
-    totalHits: typeof data?.total_results === 'number' ? data.total_results : posts.length,
-    articles,
-    ...(articles.length === 0 ? { note: 'Keine Treffer in diesem Fenster — hoursBack erhoehen oder language/category lockern.' } : {}),
+    ...(articles.length === 0 ? { note: 'Keine Treffer — query/language lockern oder gnews_top_headlines verwenden.' } : {}),
   };
 });
 
@@ -1149,14 +825,13 @@ toolRegistry.register({
 //     * The Guardian Open Platform — wirklich open source (Apache-2.0 auf GitHub),
 //       kostenlose API (5.000 Req/Tag, Key per E-Mail-Aktivierung).
 //     * NewsData.io / Currents / GDELT — Free-Tier mit API-Key bzw. ganz ohne Key.
-//     * Webz.io (hier als webz_news integriert) — 1 Mio. Seiten kostenlos.
 // - Endpunkte:
 //     GET https://gnews.io/api/v4/search?q=<query>&lang=de&max=3&apikey=<KEY>
 //     GET https://gnews.io/api/v4/top-headlines?category=business&lang=de&max=3&apikey=<KEY>
 //   Antwort: { totalArticles, articles: [{ title, description, url, image, pubDate }] }
 //   Fehler: HTTP 4xx/5xx + {"errors":["..."]} (z. B. invalid key, quota exceeded).
 // - CORS: api.gnews.io sendet keine Access-Control-Allow-Origin-Headers; direkte
-//   Browser-Fetches werden blockiert. Lösung wie bei Webz.io:
+//   Browser-Fetches werden blockiert. Lösung:
 //     * Dev: Vite-Proxy /gnews-api → https://gnews.io (siehe vite.config.js)
 //     * Prod: eigene Proxy-Basis in den Settings (gnewsApiBaseUrl)
 //     * Fallback: öffentliche JSON-CORS-Proxies (allorigins.win, corsproxy.io)
@@ -1246,7 +921,7 @@ toolRegistry.register({
     'Aktuelle Nachrichten über die GNews.io-API (json, ohne Registrierung via Demo-Key nutzbar; ' +
     'mit kostenlosem API-Key 100 Abfragen/Tag). Sucht in internationalen Quellen inkl. deutscher ' +
     'Presse und liefert Titel, Quelle, Snippet und Zeitstempel. Tier-1-Werkzeug für News-Fragen; ' +
-    'bei Demo-Limit-Fehler auf news_search (RSS) oder webz_news ausweichen.',
+    'das news_search-Tool nutzt dieselbe GNews-API.',
   category: 'data_source',
   inputSchema: {
     type: 'object',
