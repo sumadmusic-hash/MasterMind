@@ -20,6 +20,12 @@ export const AppSettingsSchema = z.object({
   // Optionale Basis-URL für Webz-Aufrufe (CORS-Proxy, z. B. eigener Backend-Proxy).
   // Leer = Vite-Dev-Proxy /webz-api.
   webzApiBaseUrl: z.string().optional(),
+  // GNews.io News API (https://gnews.io/): optionaler kostenloser API-Key
+  // (100 Abfragen/Tag). Leer = offizieller Demo-Key "demo" (10 Abfragen/Tag,
+  // funktioniert ohne Registrierung). Wird nur lokal in IndexedDB gespeichert.
+  gnewsApiKey: z.string().optional(),
+  // Optionale Basis-URL für GNews-Aufrufe (CORS-Proxy). Leer = Vite-Dev-Proxy /gnews-api.
+  gnewsApiBaseUrl: z.string().optional(),
   primaryModel: ModelConfigSchema,
   // Fallback-Kette: bis zu 6 Modelle, der Reihe nach ausprobiert, wenn das
   // vorherige Modell fehlschlägt (Rate-Limit, Serverfehler, fehlender API-Key …).

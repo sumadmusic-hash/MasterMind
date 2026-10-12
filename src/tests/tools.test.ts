@@ -149,6 +149,99 @@ describe('ToolRegistry', () => {
     expect(defs.some(d => d.name === 'webz_top_news')).toBe(true);
   });
 
+  // GNews.io News API (https://gnews.io/) — kostenlose, demo-key-fähige JSON-Suche.
+  it('should have gnews_search and gnews_top_headlines tools registered', () => {
+    const search = toolRegistry.getTool('gnews_search');
+    expect(search).toBeDefined();
+    expect(search?.category).toBe('data_source');
+    expect(search?.enabled).toBe(true);
+    expect(search?.inputSchema.required).toContain('query');
+
+    const top = toolRegistry.getTool('gnews_top_headlines');
+    expect(top).toBeDefined();
+    expect(top?.inputSchema.properties.category.enum).toContain('business');
+
+    const defs = toolRegistry.getToolDefinitionsForLLM();
+    expect(defs.some(d => d.name === 'gnews_search')).toBe(true);
+    expect(defs.some(d => d.name === 'gnews_top_headlines')).toBe(true);
+  });
+
+  it('gnews_search calls /api/v4/search with demo key fallback and maps articles', async () => {
+    const fetchCalls: string[] = [];
+    const origFetch = globalThis.fetch;
+    (globalThis as any).fetch = async (url: any, init?: any) => {
+      fetchCalls.push(String(url));
+      return {
+        ok: true, status: 200,
+        json: async () => ({ totalArticles: 1 }),
+        text: async () => JSON.stringify({
+          totalArticles: 1,
+          articles: [{
+            title: 'Testmeldung',
+            description: '<p>Kurzbeschreibung</p>',
+            url: 'https://example.com/a1',
+            pubDate: '2026-10-12T10:00:00Z',
+          }],
+        }),
+      };
+    };
+    try {
+      let result: any;
+      try {
+        result = await toolRegistry.execute({
+          id: 't', toolId: 'gnews_search', toolName: 'gnews_search',
+          arguments: { query: 'Bayer' }, timestamp: Date.now(),
+        });
+      } finally {
+        vi.restoreAllMocks();
+      }
+
+      expect(result.success).toBe(true);
+      // Dev-Proxy-Pfad + v4-Endpunkt + Demo-Key als Standard-API-Key
+      expect(fetchCalls[0]).toContain('/gnews-api/api/v4/search?');
+      expect(fetchCalls[0]).toContain('q=Bayer');
+      expect(fetchCalls[0]).toContain('lang=de');
+      expect(fetchCalls[0]).toContain('apikey=demo');
+      const articles: any[] = (result.data as any).articles;
+      expect(articles[0].title).toBe('Testmeldung');
+      expect(articles[0].snippet).toBe('Kurzbeschreibung');
+      expect(articles[0].url).toBe('https://example.com/a1');
+      expect(articles[0].source).toBe('example.com');
+      expect(articles[0].provider).toBe('gnews.io');
+      expect((result.data as any).totalHits).toBe(1);
+    } finally {
+      (globalThis as any).fetch = origFetch;
+    }
+  });
+
+  it('gnews_search uses a user-configured API key when present', async () => {
+    const fetchCalls: string[] = [];
+    const origFetch = globalThis.fetch;
+    (globalThis as any).fetch = async (url: any) => {
+      fetchCalls.push(String(url));
+      return {
+        ok: true, status: 200,
+        json: async () => ({}),
+        text: async () => JSON.stringify({ totalArticles: 0, articles: [] }),
+      };
+    };
+    try {
+      const db = await import('../services/database');
+      vi.spyOn(db, 'getSettings').mockResolvedValue({ gnewsApiKey: 'user-key-123' } as any);
+
+      const result = await toolRegistry.execute({
+        id: 't', toolId: 'gnews_search', toolName: 'gnews_search',
+        arguments: { query: 'Test', language: 'en' }, timestamp: Date.now(),
+      });
+      expect(result.success).toBe(true);
+      expect(fetchCalls[0]).toContain('apikey=user-key-123');
+      expect(fetchCalls[0]).toContain('lang=en');
+    } finally {
+      vi.restoreAllMocks();
+      (globalThis as any).fetch = origFetch;
+    }
+  });
+
   it('webz_news fails with helpful error when no token is configured', async () => {
     const result = await toolRegistry.execute({
       id: 't', toolId: 'webz_news', toolName: 'webz_news',

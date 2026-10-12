@@ -24,6 +24,8 @@ A modular, extensible AI-powered research web application with chat, tool orches
 |------|----------|-------------|
 | Web Search | Data Source | Search the web for current information |
 | News Search | Data Source | Find recent news articles with timestamps |
+| GNews Search | Data Source | Free JSON news search via gnews.io (demo key, no signup required; optional free API key for 100 req/day) |
+| GNews Top Headlines | Data Source | Trending headlines per category via gnews.io (free demo key) |
 | Company Lookup | Data Source | Look up company info and ticker symbols |
 | Stock Price | Data Source | Get current and historical stock data |
 | Data Filter | Filter | Filter, sort, and deduplicate data |

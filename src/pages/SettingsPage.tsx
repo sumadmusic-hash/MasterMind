@@ -17,6 +17,8 @@ export function SettingsPage() {
   const [showWebzToken, setShowWebzToken] = useState(false);
   const [testingWebz, setTestingWebz] = useState(false);
   const [webzTestResult, setWebzTestResult] = useState<{ success: boolean; error?: string } | null>(null);
+  const [gnewsTestResult, setGnewsTestResult] = useState<{ success: boolean; error?: string } | null>(null);
+  const [testingGnews, setTestingGnews] = useState(false);
   const [testingProvider, setTestingProvider] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ provider: string; success: boolean; error?: string } | null>(null);
   const [advanced, setAdvanced] = useState(false);
@@ -78,6 +80,47 @@ export function SettingsPage() {
       setWebzTestResult({ success: false, error: err.message || 'Verbindung fehlgeschlagen' });
     }
     setTestingWebz(false);
+  };
+
+  // GNews.io testen: optionaler eigener Key (bzw. Demo-Key fallback) gegen den
+  // echten Endpunkt validieren — über dieselbe Proxy-Kaskade wie die gnews_*-Tools.
+  const handleTestGnews = async () => {
+    setTestingGnews(true);
+    setGnewsTestResult(null);
+    try {
+      const base = String(settings.gnewsApiBaseUrl || '').trim().replace(/\/+$/, '') || '/gnews-api';
+      const key = String(settings.gnewsApiKey || '').trim() || 'demo';
+      const target = `${base}/api/v4/search?${new URLSearchParams({ q: 'test', lang: 'de', max: '1', apikey: key })}`;
+      const urls = [
+        target,
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+        `https://corsproxy.io/?url=${encodeURIComponent(target)}`,
+      ];
+      let lastError = 'Alle Zugriffswege fehlgeschlagen';
+      for (const url of urls) {
+        try {
+          const resp = await fetch(url, { signal: AbortSignal.timeout(10000), credentials: 'omit' });
+          if (!resp.ok) { lastError = `HTTP ${resp.status}`; continue; }
+          const data = await resp.json().catch(() => null);
+          if (Array.isArray(data?.errors) && data.errors.length > 0) {
+            throw new Error(`GNews: ${data.errors.join('; ')}`);
+          }
+          if (Array.isArray(data?.articles)) {
+            setGnewsTestResult({ success: true });
+            setTestingGnews(false);
+            return;
+          }
+          lastError = 'Unerwartetes Antwortformat (kein articles-Feld)';
+        } catch (err: any) {
+          if (String(err?.message || '').startsWith('GNews:')) throw err;
+          lastError = err.message || lastError;
+        }
+      }
+      setGnewsTestResult({ success: false, error: lastError });
+    } catch (err: any) {
+      setGnewsTestResult({ success: false, error: err.message || 'Verbindung fehlgeschlagen' });
+    }
+    setTestingGnews(false);
   };
 
   const handleClearData = async () => {
@@ -219,6 +262,39 @@ export function SettingsPage() {
                 </div>
               )}
             </div>
+
+            {/* GNews.io News API */}
+            <div>
+              <label className="text-sm text-gray-400 mb-1 block">GNews.io API Key (optional, kostenlos)</label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={settings.gnewsApiKey || ''}
+                  onChange={e => updateSettings({ gnewsApiKey: e.target.value })}
+                  placeholder="leer = Demo-Key (10 Abfragen/Tag, ohne Registrierung)"
+                  className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                />
+                <button
+                  onClick={handleTestGnews}
+                  disabled={testingGnews}
+                  className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 transition-colors disabled:opacity-50"
+                >
+                  {testingGnews ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Für die KI-Tools „GNews Search“ und „GNews Top Headlines“. Ohne Eintrag wird der freie
+                Demo-Key genutzt (10 Abfragen/Tag); ein kostenloser Key von https://gnews.io erhöht das
+                Limit auf 100 Abfragen/Tag. Requests laufen über den Dev-Proxy /gnews-api bzw. öffentliche
+                CORS-Proxies, da api.gnews.io kein CORS erlaubt.
+              </p>
+              {gnewsTestResult && (
+                <div className={`flex items-center gap-1 mt-1 text-xs ${gnewsTestResult.success ? 'text-green-400' : 'text-red-400'}`}>
+                  {gnewsTestResult.success ? <Check className="w-3 h-3" /> : <X className="w-3 h-3" />}
+                  {gnewsTestResult.success ? 'Connection successful' : gnewsTestResult.error}
+                </div>
+              )}
+            </div>
           </div>
         </section>
 
@@ -340,6 +416,23 @@ export function SettingsPage() {
                   api.webz.io sendet keine CORS-Headers. Für Produktions-Builds hier die Basis eines
                   eigenen Proxys eintragen (z. B. https://proxy.example.de/webz), der Requests an
                   https://api.webz.io weiterreicht.
+                </p>
+              </div>
+
+              <div>
+                <label className="text-sm text-gray-400 mb-1 block">GNews.io Proxy-Basis (optional)</label>
+                <input
+                  type="text"
+                  value={settings.gnewsApiBaseUrl || ''}
+                  onChange={e => updateSettings({ gnewsApiBaseUrl: e.target.value })}
+                  placeholder="leer = /gnews-api (Vite-Dev-Proxy, dann öffentliche CORS-Proxies als Fallback)"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  api.gnews.io sendet keine CORS-Headers. Für Produktions-Builds hier die Basis eines
+                  eigenen Proxys eintragen (z. B. https://proxy.example.de/gnews), der Requests an
+                  https://gnews.io weiterreicht. Bleibt das Feld leer, werden automatisch öffentliche
+                  CORS-Proxies (allorigins.win, corsproxy.io) als Fallback genutzt.
                 </p>
               </div>
 
