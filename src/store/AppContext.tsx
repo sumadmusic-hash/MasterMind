@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useEffect, useMemo, type ReactNode } from 'react';
+import { createContext, useContext, useReducer, useEffect, useMemo, useRef, useCallback, type ReactNode } from 'react';
 import type { AppSettings, ChatSession, WorkflowDefinition, TokenBudget } from '../types';
 import { getSettings, saveSettings, getChatSessions, getWorkflows } from '../services/database';
 import { tpmManager } from '../services/tpm';
@@ -132,12 +132,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => { unsubscribe(); clearInterval(interval); };
   }, []);
 
-  const updateSettings = async (updates: Partial<AppSettings>) => {
-    const newSettings = { ...state.settings, ...updates } as AppSettings;
+  // Stabiler Ref auf den aktuellsten Settings-State: updateSettings kann damit
+  // als useCallback([]) definiert werden (stabile Identität über alle Renders),
+  // ohne ein veraltetes `state.settings` Closure zu verwenden.
+  const settingsRef = useRef<AppSettings | null>(state.settings);
+  useEffect(() => { settingsRef.current = state.settings; }, [state.settings]);
+
+  const updateSettings = useCallback(async (updates: Partial<AppSettings>) => {
+    const newSettings = { ...settingsRef.current, ...updates } as AppSettings;
+    settingsRef.current = newSettings;
     dispatch({ type: 'SET_SETTINGS', payload: newSettings });
     await saveSettings(updates);
     tpmManager.configure(newSettings);
-  };
+  }, []);
 
   // Provider-Value stabil halten: sonst bekommen ALLE Konsumenten bei jedem
   // Parent-Render ein neues Objekt und renderen unnötig mit.
