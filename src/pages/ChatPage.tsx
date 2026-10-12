@@ -5,8 +5,11 @@ import { saveChatSession, deleteChatSession } from '../services/database';
 import type { ChatSession, ChatMessage, ToolCall, ToolResult } from '../types';
 import {
   Send, Square, Plus, Trash2, Copy, Check, ExternalLink,
-  AlertCircle, Loader2, Bot, User, Wrench, ChevronDown, ChevronUp
+  AlertCircle, Loader2, Bot, User, Wrench, ChevronDown, ChevronUp, RotateCcw
 } from 'lucide-react';
+
+/** Marker text that chat.ts uses to persist an interrupted (resumable) turn. */
+const INTERRUPTED_MARKER = 'Prozess angehalten';
 
 export function ChatPage() {
   const { state, dispatch } = useApp();
@@ -15,6 +18,9 @@ export function ChatPage() {
   const [streamContent, setStreamContent] = useState('');
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
+  // True when the last error was a content refusal ("all models declined") —
+  // shows an explanatory hint next to the Fortsetzen button.
+  const [lastErrorWasRefusal, setLastErrorWasRefusal] = useState(false);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [toolResults, setToolResults] = useState<ToolResult[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -57,6 +63,14 @@ export function ChatPage() {
   }, []);
 
   const session = state.activeSession;
+
+  // A turn is resumable when the LAST assistant message carries the
+  // interruption marker persisted by chat.ts (refusal / budget / other error).
+  // resumeTurn() then continues from exactly that state instead of restarting.
+  const canResume = !streaming && !!session && (() => {
+    const last = session.messages[session.messages.length - 1];
+    return !!last && last.role === 'assistant' && last.content.includes(INTERRUPTED_MARKER);
+  })();
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -187,6 +201,7 @@ export function ChatPage() {
     setStreaming(true);
     resetStreamContent();
     setError('');
+    setLastErrorWasRefusal(false);
     setToolCalls([]);
     setToolResults([]);
     setStatus('Starting...');
@@ -237,6 +252,12 @@ export function ChatPage() {
             resetStreamContent();
             setStatus('');
           },
+          onInterruption: ({ refusal }) => {
+            // The orchestrator persisted the interrupted turn WITH all finished
+            // steps/tool results — remember whether this was a content refusal
+            // so the UI can explain and offer "Fortsetzen" (resumeTurn).
+            setLastErrorWasRefusal(refusal);
+          },
           onStatus: (s) => {
             setStatus(s);
           },
@@ -248,6 +269,84 @@ export function ChatPage() {
       syncSession({ ...currentSession, messages: [...currentSession.messages] });
       setStreaming(false);
     } catch (err: any) {
+      setError(err.message);
+      setStreaming(false);
+      setStatus('');
+    }
+  };
+
+  /**
+   * Continue the last interrupted turn instead of restarting it: the
+   * orchestrator replays completed steps & tool results into the conversation,
+   * so only the remaining work runs (e.g. after every model refused or the TPM
+   * budget was exhausted).
+   */
+  const handleResume = async () => {
+    if (!session || streaming) return;
+    if (!state.settings) {
+      setError('Please configure settings first');
+      return;
+    }
+
+    let currentSession: ChatSession = { ...session, messages: [...session.messages] };
+
+    const syncSession = (s: ChatSession) => {
+      currentSession = s;
+      dispatch({ type: 'UPDATE_SESSION', payload: s });
+    };
+
+    setStreaming(true);
+    resetStreamContent();
+    setError('');
+    setLastErrorWasRefusal(false);
+    setToolCalls([]);
+    setToolResults([]);
+    setStatus('Fortsetzung läuft...');
+
+    try {
+      await chatOrchestrator.resumeTurn(
+        state.settings,
+        currentSession,
+        {
+          onToken: (token) => {
+            queueStreamToken(token);
+          },
+          onToolCall: (call) => {
+            setToolCalls(prev => [...prev, call]);
+          },
+          onToolResult: (result) => {
+            setToolResults(prev => [...prev, result]);
+          },
+          onComplete: (message) => {
+            const updated: ChatSession = {
+              ...currentSession,
+              messages: [...currentSession.messages],
+              updatedAt: Date.now(),
+            };
+            syncSession(updated);
+            setStreaming(false);
+            resetStreamContent();
+            setStatus('');
+          },
+          onError: (err) => {
+            setError(err);
+            syncSession({ ...currentSession, messages: [...currentSession.messages] });
+            setStreaming(false);
+            resetStreamContent();
+            setStatus('');
+          },
+          onInterruption: ({ refusal }) => {
+            setLastErrorWasRefusal(refusal);
+          },
+          onStatus: (s) => {
+            setStatus(s);
+          },
+        }
+      );
+      syncSession({ ...currentSession, messages: [...currentSession.messages] });
+      setStreaming(false);
+    } catch (err: any) {
+      // e.g. "Kein angehaltener Turn gefunden" – nothing to resume.
       setError(err.message);
       setStreaming(false);
       setStatus('');
@@ -396,9 +495,31 @@ export function ChatPage() {
               <div>
                 <p className="text-sm text-red-300">{error}</p>
                 <p className="text-xs text-red-400/60 mt-1">
-                  Check your API keys in Settings, or try a different model.
+                  {lastErrorWasRefusal
+                    ? 'Alle Modelle haben die Anfrage abgelehnt. Bereits abgeschlossene Schritte bleiben erhalten – „Fortsetzen“ übernimmt sie nicht erneut.'
+                    : 'Check your API keys in Settings, or try a different model.'}
                 </p>
               </div>
+            </div>
+          )}
+
+          {/* Fortsetzen: the last turn was interrupted (refusal / budget /
+              error) but its completed steps & tool results were persisted —
+              resumeTurn() continues from exactly that state. */}
+          {canResume && (
+            <div className="flex items-center gap-2 pl-11">
+              <button
+                onClick={handleResume}
+                disabled={!state.settings}
+                title="Den unterbrochenen Turn fortsetzen – abgeschlossene Schritte und Tool-Ergebnisse werden NICHT erneut ausgeführt"
+                className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm rounded-lg transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Fortsetzen
+              </button>
+              <span className="text-xs text-gray-500">
+                Abgeschlossene Schritte bleiben erhalten – die Aufgabe wird fortgesetzt, nicht neu gestartet.
+              </span>
             </div>
           )}
 

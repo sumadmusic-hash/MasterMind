@@ -78,6 +78,13 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 
 (Grundregeln: Immer Quellen zitieren; Fakten von Analyse/Unsicherheit trennen — Korrelation ist nicht Kausalität; fehlende Daten klar benennen; in der Sprache des Nutzers antworten.)`;
 
+/** Describes WHY a turn stopped without completing (see onInterruption). */
+export interface TurnInterruption {
+  /** True when every model in the fallback chain declined the request. */
+  refusal: boolean;
+  message: string;
+}
+
 export interface ChatOrchestratorCallbacks {
   onToken: (token: string) => void;
   onToolCall: (call: ToolCall) => void;
@@ -85,6 +92,15 @@ export interface ChatOrchestratorCallbacks {
   onComplete: (message: ChatMessage) => void;
   onError: (error: string) => void;
   onStatus: (status: string) => void;
+  /**
+   * Optional: fired IN ADDITION to onError whenever a turn stops incomplete
+   * (all models refused, budget exhausted, other failure). The interrupted turn
+   * is persisted together with everything already accomplished, so the UI can
+   * offer "Fortsetzen" (chatOrchestrator.resumeTurn) instead of a plain retry
+   * that would restart the task from scratch. `refusal` distinguishes "every
+   * model declined" from an infrastructure failure.
+   */
+  onInterruption?: (interruption: TurnInterruption) => void;
 }
 
 /**
@@ -111,6 +127,22 @@ const NOOP_CALLBACKS: ChatOrchestratorCallbacks = {
   onError: () => {},
   onStatus: () => {},
 };
+
+/** True when the provider chain ended in a content refusal ("all declined"). */
+function isRefusalError(err: any): boolean {
+  return err?.refusal === true || err?.name === 'ModelRefusalError';
+}
+
+/**
+ * Report an interruption to the caller: onError for the visible message plus
+ * onInterruption so the UI knows a resumable, partially completed turn was
+ * persisted and can offer a "Fortsetzen" action.
+ */
+function emitInterruption(callbacks: ChatOrchestratorCallbacks, err: any): void {
+  const message = err?.message || 'An error occurred';
+  callbacks.onError(message);
+  callbacks.onInterruption?.({ refusal: isRefusalError(err), message });
+}
 
 export class ChatOrchestrator {
   private abortController: AbortController | null = null;
@@ -156,7 +188,7 @@ export class ChatOrchestrator {
       if (loop?.interruption) {
         this.persistInterruptedTurn(session, loop.interruption.err, loop.interruption.ctx);
         await saveChatSession(session);
-        callbacks.onError(loop.interruption.err.message || 'An error occurred');
+        emitInterruption(callbacks, loop.interruption.err);
         await addLog({ level: 'error', message: `Chat error: ${loop.interruption.err.message}`, timestamp: Date.now() });
       }
     } catch (err: any) {
@@ -176,7 +208,8 @@ export class ChatOrchestrator {
         return;
       }
       // Interruptions outside the agent loop must not discard progress either:
-      // persist the partial turn so a retry can build on it.
+      // persist the partial turn (with the resumable marker) so a later
+      // resumeTurn() continues from here instead of restarting the task.
       if (this.partialContent.trim().length > 0) {
         this.appendMessage(session, {
           id: crypto.randomUUID(),
@@ -186,7 +219,7 @@ export class ChatOrchestrator {
         });
         await saveChatSession(session);
       }
-      callbacks.onError(err.message || 'An error occurred');
+      emitInterruption(callbacks, err);
       await addLog({ level: 'error', message: `Chat error: ${err.message}`, timestamp: Date.now() });
     }
 
@@ -232,7 +265,7 @@ export class ChatOrchestrator {
       const loop = await this.runAgentLoop(settings, session, callbacks);
       if (loop?.interruption) {
         this.persistInterruptedTurn(session, loop.interruption.err, loop.interruption.ctx);
-        callbacks.onError(loop.interruption.err.message || 'An error occurred');
+        emitInterruption(callbacks, loop.interruption.err);
         await addLog({ level: 'error', message: `Resume error: ${loop.interruption.err.message}`, timestamp: Date.now() });
       }
     } catch (err: any) {
@@ -257,7 +290,7 @@ export class ChatOrchestrator {
           timestamp: Date.now(),
         });
       }
-      callbacks.onError(err.message || 'An error occurred');
+      emitInterruption(callbacks, err);
       await addLog({ level: 'error', message: `Resume error: ${err.message}`, timestamp: Date.now() });
     }
 
@@ -403,8 +436,26 @@ export class ChatOrchestrator {
         fullContent += result.content;
       } catch (err: any) {
         if (err.name === 'AbortError') throw err;
-        callbacks.onError(err.message);
-        return;
+        // The whole fallback chain failed or refused. DON'T end the turn here
+        // with a bare onError — that would discard everything completed so far.
+        // Return an interruption descriptor instead so sendMessage/resumeTurn
+        // can persist the finished steps, tool calls/results and sources; a
+        // later resumeTurn() continues from exactly this state.
+        return {
+          interruption: {
+            err,
+            ctx: {
+              partialContent: this.partialContent,
+              stepContents,
+              turnToolCalls,
+              turnToolResults,
+              sources,
+              model: currentModel,
+              provider: currentProvider,
+              tokens: totalTokens,
+            },
+          },
+        };
       }
 
       // If no tool calls, we're done
@@ -435,6 +486,10 @@ export class ChatOrchestrator {
       // last step's text survived and earlier output had to be produced again.
       if (assistantContent.trim().length > 0) {
         fullContent += (fullContent ? '\n\n' : '') + assistantContent;
+        // Record it as a COMPLETED step so an interrupted turn can be persisted
+        // with all prior output (persistInterruptedTurn → stepContents) and a
+        // resumed turn does not have to regenerate earlier steps' text.
+        stepContents.push(assistantContent);
       }
 
       // Process tool calls. Assign a stable unique id to every call FIRST and
@@ -557,8 +612,14 @@ export class ChatOrchestrator {
         }
       }
 
-      // Reset content for next iteration
-      fullContent = '';
+      // NOTE: `fullContent` must NOT be reset here. It accumulates every
+      // completed step of the turn (streamed planning text + final answer) so
+      // that the max-steps fallback message below contains all prior output,
+      // and an interrupted turn persists its progress instead of losing it.
+
+      if (lastStepContent.trim().length > 0) {
+        this.partialContent = lastStepContent;
+      }
     }
 
     // Max steps reached — persist the tool activity too, so a later resume or
@@ -599,7 +660,7 @@ export class ChatOrchestrator {
       tokens: number;
     }
   ): void {
-    const refusal = err?.refusal === true || err?.name === 'ModelRefusalError';
+    const refusal = isRefusalError(err);
     const body = [
       ...ctx.stepContents.map(c => c.trim()).filter(Boolean),
       ctx.partialContent.trim(),
@@ -635,7 +696,9 @@ export class ChatOrchestrator {
     if (!last.content.includes(INTERRUPTED_SUFFIX)) return;
     if (!last.toolCalls?.length || !last.toolResults?.length) return;
 
-    const resultById = new Map(last.toolResults.map(r => [r.id, r]));
+    // ToolResult carries the call id in `callId` (see types) — matching by a
+    // non-existent `r.id` would silently drop every replayed result.
+    const resultById = new Map(last.toolResults.map(r => [r.callId, r]));
     const usable = last.toolCalls.filter(c => resultById.has(c.id));
     if (usable.length === 0) return;
 
