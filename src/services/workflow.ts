@@ -10,25 +10,33 @@ export interface WorkflowExecutionContext {
 }
 
 class WorkflowEngine {
-  validateWorkflow(workflow: WorkflowDefinition): { valid: boolean; errors: string[] } {
+  validateWorkflow(
+    workflow: WorkflowDefinition,
+    options: { allowCycles?: boolean; ignoreDanglingEdges?: boolean } = {}
+  ): { valid: boolean; errors: string[] } {
     const errors: string[] = [];
 
     if (!workflow.nodes || workflow.nodes.length === 0) {
       errors.push('Workflow must have at least one node');
     }
 
-    // Check for cycles
-    if (this.hasCycle(workflow.nodes, workflow.edges)) {
+    // Check for cycles. During execution cycles are tolerated: topologicalSort
+    // appends cycle members so no work is silently dropped. Structural edits
+    // (editor save/validation) keep the strict behaviour by default.
+    if (!options.allowCycles && this.hasCycle(workflow.nodes, workflow.edges)) {
       errors.push('Workflow contains circular dependencies');
     }
 
-    // Check node connections
+    // Check node connections. Dangling edges are ignored during execution as
+    // well (topologicalSort skips them), so they must not abort a run.
+    if (!options.ignoreDanglingEdges) {
     for (const edge of workflow.edges) {
       const sourceNode = workflow.nodes.find(n => n.id === edge.source);
       const targetNode = workflow.nodes.find(n => n.id === edge.target);
       
       if (!sourceNode) errors.push(`Edge references missing source node: ${edge.source}`);
       if (!targetNode) errors.push(`Edge references missing target node: ${edge.target}`);
+    }
     }
 
     // Check that tool IDs exist
@@ -87,7 +95,10 @@ class WorkflowEngine {
     // Use performance.now() for sub-millisecond accuracy; Date.now() would often yield 0
     const startTime = performance.now();
     
-    const validation = this.validateWorkflow(workflow);
+    const validation = this.validateWorkflow(workflow, {
+      allowCycles: true,        // topologicalSort tolerates cycles (see BUGFIX below)
+      ignoreDanglingEdges: true, // topologicalSort ignores edges to unknown nodes
+    });
     if (!validation.valid) {
       return { success: false, error: validation.errors.join('; '), duration: Math.max(1, Math.round(performance.now() - startTime)) };
     }
@@ -189,13 +200,19 @@ class WorkflowEngine {
     const inDegree = new Map<string, number>();
     const graph = new Map<string, string[]>();
 
+    const nodeIds = new Set(nodes.map(n => n.id));
+
     for (const node of nodes) {
       inDegree.set(node.id, 0);
       graph.set(node.id, []);
     }
 
     for (const edge of edges) {
-      const neighbors = graph.get(edge.source) || [];
+      // Ignore edges that reference unknown nodes — otherwise the ghost id
+      // would be injected into inDegree/graph and its target's in-degree
+      // would never be decremented, silently dropping valid nodes.
+      if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+      const neighbors = graph.get(edge.source)!;
       neighbors.push(edge.target);
       graph.set(edge.source, neighbors);
       inDegree.set(edge.target, (inDegree.get(edge.target) || 0) + 1);

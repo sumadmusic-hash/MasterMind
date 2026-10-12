@@ -322,7 +322,7 @@ export function seriesStats(values: number[]): {
 }
 
 /** Downsample a [{date,value}] series to at most `maxPoints` (keeps first+last). */
-export function downsample<T extends { date: string }>(points: T[], maxPoints = 60): T[] {
+export function downsample<T extends { date: string; value?: number }>(points: T[], maxPoints = 60): T[] {
   if (points.length <= maxPoints || maxPoints < 2) return points;
   const step = Math.ceil(points.length / maxPoints);
   const out: T[] = [];
@@ -3053,7 +3053,7 @@ toolRegistry.register({
     if (pts.length === 0) throw new Error('timeseries enthält keine gültigen {date,value}-Paare.');
     const sampled = downsample(pts, MAX_POINTS);
     categories = sampled.map(p => p.date);
-    series = [{ name: args.series?.[0]?.name || 'Wert', data: sampled.map(p => p.value) }];
+    series = [{ name: args.series?.[0]?.name || 'Wert', data: sampled.map(p => p.value as number) }];
   } else if (Array.isArray(args.categories) && Array.isArray(args.series)) {
     categories = args.categories.map((c: any) => String(c));
     if (categories.length === 0) throw new Error('categories ist leer.');
