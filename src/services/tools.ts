@@ -179,7 +179,15 @@ class ToolRegistry {
   }
 
   toggleTool(id: string, enabled: boolean): void {
-    const tool = this.tools.get(id);
+    // Resolve near-miss ids like everywhere else — but only within the raw map
+    // (`tools.has`), never via getTool()/resolveToolId(): the fuzzy substring
+    // fallback would happily toggle a *different* tool than the one requested.
+    let resolved = id;
+    if (!this.tools.has(resolved)) {
+      const direct = [id.toLowerCase(), id.replace(/[-\s]/g, '_'), id.replace(/^get_|^fetch_|^lookup_/, ''), id.replace(/_$/, '')];
+      for (const cand of direct) if (this.tools.has(cand)) { resolved = cand; break; }
+    }
+    const tool = this.tools.get(resolved);
     if (tool) {
       tool.enabled = enabled;
     }
@@ -447,14 +455,20 @@ toolRegistry.register({
 
   try {
     // Step 1: resolve the place name to coordinates (free, CORS-enabled).
-    const geoResp = await fetch(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=de&format=json`,
-      { signal: AbortSignal.timeout(6000) }
-    );
-    const geo = await geoResp.json();
-    const place = geo?.results?.[0];
+    // A failing/empty geocoding response must not abort the whole lookup —
+    // it should fall through to the wttr.in fallback below.
+    let place: any = null;
+    try {
+      const geoResp = await fetch(
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=de&format=json`,
+        { signal: AbortSignal.timeout(6000) }
+      );
+      const geo = await geoResp.json();
+      place = geo?.results?.[0];
 
-    // Step 2: current conditions + daily forecast from Open-Meteo (no key needed).
+      // Step 2: current conditions + daily forecast from Open-Meteo (no key needed).
+    } catch { /* geocoding unavailable — use the wttr.in fallback */ }
+
     if (place) {
       const wxResp = await fetch(
         `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
@@ -477,7 +491,7 @@ toolRegistry.register({
 
       return {
         found: true,
-        location: `${place.name}${place.admin1 ? ', ' + place.admin1 : ''} (${place.country || geo?.results?.[0]?.country || ''})`,
+        location: `${place.name}${place.admin1 ? ', ' + place.admin1 : ''} (${place.country || ''})`,
         coordinates: { lat: place.latitude, lon: place.longitude },
         current: {
           temperatureC: cur.temperature_2m,
