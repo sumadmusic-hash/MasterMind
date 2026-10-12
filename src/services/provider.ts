@@ -91,10 +91,15 @@ export async function callProvider(
   callbacks?: StreamCallbacks,
   abortSignal?: AbortSignal
 ): Promise<{ content: string; usage: TokenUsage; model: string; provider: string }> {
+  // Primärmodell + bis zu 6 Fallbacks, der Reihe nach.
   const modelConfigs: ModelConfig[] = [
     settings.primaryModel,
     settings.fallback1,
     settings.fallback2,
+    settings.fallback3,
+    settings.fallback4,
+    settings.fallback5,
+    settings.fallback6,
   ].filter((m): m is ModelConfig => !!m);
 
   let lastError: Error | null = null;

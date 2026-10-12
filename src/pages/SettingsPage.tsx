@@ -161,23 +161,16 @@ export function SettingsPage() {
 
             />
 
-            {/* Fallback 1 */}
-            <ModelSelector
-              label="Fallback 1"
-              config={settings.fallback1}
-              onChange={(config) => updateSettings({ fallback1: config })}
-
-              optional
-            />
-
-            {/* Fallback 2 */}
-            <ModelSelector
-              label="Fallback 2"
-              config={settings.fallback2}
-              onChange={(config) => updateSettings({ fallback2: config })}
-
-              optional
-            />
+            {/* Fallbacks 1–6 */}
+            {([1, 2, 3, 4, 5, 6] as const).map((i) => (
+              <ModelSelector
+                key={i}
+                label={`Fallback ${i}`}
+                config={settings[`fallback${i}` as 'fallback1']}
+                onChange={(config) => updateSettings({ [`fallback${i}`]: config })}
+                optional
+              />
+            ))}
           </div>
         </section>
 

@@ -6,7 +6,7 @@ A modular, extensible AI-powered research web application with chat, tool orches
 
 ### Core Capabilities
 - **Chat Interface**: Full conversational AI with streaming responses, tool call visibility, and source citations
-- **Multi-Provider Support**: Groq and OpenRouter with 3 configurable model slots (primary + 2 fallbacks)
+- **Multi-Provider Support**: Groq and OpenRouter with 7 configurable model slots (primary + 6 fallbacks)
 - **Automatic Fallback**: Intelligent failover between models on errors, rate limits, or server issues
 - **Token Budget Management (TPM)**: Server-side token-per-minute control with reservation system for parallel requests
 - **Tool Registry**: Modular tools with validation, permissions, timeouts, and data limits
@@ -96,8 +96,7 @@ npx vitest run
 
 ### Model Configuration
 - **Primary Model**: The main model used for all requests
-- **Fallback 1**: Used when primary fails (rate limit, error, timeout)
-- **Fallback 2**: Used when both primary and fallback 1 fail
+- **Fallback 1–6**: Tried in order when the previous model fails (rate limit, error, timeout). All fallback slots are optional.
 
 Each slot can independently select provider and model.
 
