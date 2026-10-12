@@ -87,6 +87,33 @@ export function detectRefusal(content: string): boolean {
   return false;
 }
 
+/**
+ * A model that streams back NEITHER text nor tool calls produced no usable
+ * answer. This happens with weaker/free models when a prompt carries tool
+ * results they cannot handle — the request succeeds (HTTP 200, tokens billed)
+ * but the reply is empty. Previously such "silent refusals" ended the agent
+ * loop as a normal completion: the user saw NO answer at all while every
+ * earlier step's tokens were already spent. Treating them like a content
+ * refusal lets the fallback chain take over and keeps the turn resumable.
+ */
+export function isEmptyResponse(content: string, toolCallCount: number): boolean {
+  return !(content || '').trim() && toolCallCount === 0;
+}
+
+/** Error thrown when a model answers with an empty, useless response. */
+export class EmptyResponseError extends Error {
+  readonly refusal = true as const;
+  readonly emptyModel: string;
+  readonly emptyProvider: string;
+
+  constructor(model: string, provider: string) {
+    super(`Model "${model}" lieferte eine leere Antwort ohne Tool-Aufrufe; Fallback übernimmt…`);
+    this.name = 'EmptyResponseError';
+    this.emptyModel = model;
+    this.emptyProvider = provider;
+  }
+}
+
 /** Error thrown when a model answers but refuses the request (content policy). */
 export class ModelRefusalError extends Error {
   readonly refusal = true as const;
@@ -238,6 +265,20 @@ export async function callProvider(
         throw new ModelRefusalError(config.modelId, config.provider, result.content);
       }
 
+      // Silent refusal: no text AND no tool calls — the model answered with an
+      // empty, useless reply (common with weak/free models once the prompt
+      // carries tool results). Without this check the agent loop would end the
+      // turn "successfully" with an empty message: the user sees NO answer
+      // although every previous step already burned tokens. Hand the identical
+      // request to the next model in the chain instead.
+      if (isEmptyResponse(result.content, result.toolCallCount)) {
+        tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
+        reservationId = null;
+        await recordTokenUsage({ ...result.usage, provider: config.provider, model: config.modelId });
+        sawRefusal = true;
+        throw new EmptyResponseError(config.modelId, config.provider);
+      }
+
       // Update TPM with actual usage AND release this request's reservation in
       // one step. Previously the reservation was never released on success, so
       // its tokens were double-counted (reserved + used) until the 30s expiry.
@@ -295,6 +336,19 @@ export async function callProvider(
     throw refusalErr;
   }
 
+  // Every model in the chain answered with an empty, useless reply (no text,
+  // no tool calls). Surface that precisely instead of the generic last-error
+  // text — the user otherwise sees an unexplained failure after a high token
+  // spend. `refusal = true` keeps the turn resumable via "Fortsetzen".
+  if (lastError instanceof EmptyResponseError) {
+    const emptyErr: any = new Error(
+      'Alle Modelle lieferten eine leere Antwort ohne Tool-Aufrufe. Fortschreiten Sie mit „Fortsetzen“ oder versuchen Sie es erneut.'
+    );
+    emptyErr.refusal = true;
+    emptyErr.name = 'EmptyResponseError';
+    throw emptyErr;
+  }
+
   throw lastError || new Error('All models failed');
 }
 
@@ -307,7 +361,7 @@ async function executeProviderCall(
   callbacks: StreamCallbacks | undefined,
   abortSignal: AbortSignal | undefined,
   settings: AppSettings
-): Promise<{ content: string; usage: TokenUsage }> {
+): Promise<{ content: string; usage: TokenUsage; toolCallCount: number }> {
   // NOTE: the request URL is resolved by the caller (callProvider) BEFORE the
   // TPM reservation — an unknown provider must fail fast without ever
   // reserving/consuming budget. Previously getApiUrl ran here, after the
@@ -381,7 +435,11 @@ async function executeProviderCall(
       estimated: !data.usage,
       timestamp: Date.now(),
     };
-    return { content, usage };
+    return {
+      content,
+      usage,
+      toolCallCount: data.choices?.[0]?.message?.tool_calls?.length || 0,
+    };
   }
 }
 
@@ -394,7 +452,7 @@ export async function handleStreamingResponse(
   response: Response,
   callbacks: StreamCallbacks,
   requestMessages?: ProviderMessage[]
-): Promise<{ content: string; usage: TokenUsage }> {
+): Promise<{ content: string; usage: TokenUsage; toolCallCount: number }> {
   const reader = response.body?.getReader();
   if (!reader) throw new Error('No response body');
 
@@ -416,6 +474,10 @@ export async function handleStreamingResponse(
   interface ToolCallAccumulator { id?: string; name: string; arguments: string }
   const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
   let anonymousCallSeq = 0;
+  // Total number of complete tool calls emitted via callbacks.onToolCall.
+  // Needed by the caller to recognise "silent refusals": a reply with neither
+  // text NOR tool calls is not a valid answer (see isEmptyResponse).
+  let emittedToolCalls = 0;
   const flushToolCalls = () => {
     for (const [, acc] of toolCallAccumulators) {
       if (!acc.name && !acc.arguments) continue; // nothing meaningful streamed
@@ -424,6 +486,7 @@ export async function handleStreamingResponse(
         type: 'function',
         function: { name: acc.name, arguments: acc.arguments || '{}' },
       });
+      emittedToolCalls++;
     }
     toolCallAccumulators.clear();
   };
@@ -547,7 +610,9 @@ export async function handleStreamingResponse(
   };
 
   callbacks.onComplete(fullContent, usage);
-  return { content: fullContent, usage };
+  // toolCallCount lets the caller distinguish "empty but for tools" (a valid
+  // intermediate step) from a truly empty, useless reply ("silent refusal").
+  return { content: fullContent, usage, toolCallCount: emittedToolCalls };
 }
 
 export async function testConnection(provider: string, apiKey: string, modelId: string): Promise<{ success: boolean; error?: string }> {
