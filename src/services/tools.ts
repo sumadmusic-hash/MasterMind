@@ -2186,6 +2186,7 @@ toolRegistry.register({
 
     return {
       ticker,
+      found: true,
       name: result.meta?.longName || result.meta?.shortName,
       currency: result.meta?.currency,
       period, interval, points: rows.length,
