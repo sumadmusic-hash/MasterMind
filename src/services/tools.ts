@@ -524,10 +524,17 @@ async function fetchWebzJson(params: Record<string, string | number | boolean>):
   }
   const base = await getWebzBaseUrl();
   const qs = new URLSearchParams({ token, format: 'json', ...toQueryParams(params) });
-  const resp = await fetch(`${base}/search?${qs}`, { signal: AbortSignal.timeout(10000) });
+  // `credentials: 'omit'` unterdrückt den HTTP-Basic-Auth-Dialog des Browsers:
+  // api.webz.io antwortet bei einem ungültigen Token mit HTTP 401 + Header
+  // `WWW-Authenticate: Basic realm="Unauthorized"`. Ohne diese Option interpretiert
+  // der Browser das als Aufforderung zu Benutzername/Passwort und zeigt eine
+  // Login-Maske — obwohl Webz.io gar keine Basic-Auth kennt, sondern nur das
+  // API-Token als Query-Parameter braucht. Mit 'omit' erhalten wir stattdessen
+  // die klare Fehlermeldung unten.
+  const resp = await fetch(`${base}/search?${qs}`, { signal: AbortSignal.timeout(10000), credentials: 'omit' });
 
   if (resp.status === 401) {
-    throw new Error('Webz.io: ungültiges API-Token (HTTP 401). Token in den Einstellungen prüfen (Dashboard: https://app.webz.io/).');
+    throw new Error('Webz.io: ungültiges API-Token (HTTP 401). Token in den Einstellungen prüfen (Dashboard: https://app.webz.io/ → API-Token). Es ist kein Benutzername/Passwort nötig.');
   }
   if (resp.status === 429) {
     throw new Error('Webz.io: Rate-Limit erreicht (HTTP 429). Weniger/vorsichtigere Anfragen oder Plan-Quota prüfen.');
