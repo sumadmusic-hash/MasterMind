@@ -21,6 +21,14 @@ export interface StreamCallbacks {
    * already spent waiting). Lets the UI show progress instead of looking stuck.
    */
   onBudgetWait?: (waitMs: number, waitedMs: number) => void;
+  /**
+   * Optional: fired when a model call is about to be made so the caller knows
+   * WHICH model/provider is currently active. This matters for the fallback
+   * chain: if model A refuses or fails and model B takes over, the UI must not
+   * attribute B's answer to A — it also lets the caller reset its per-attempt
+   * streaming buffer before tokens of the new model arrive.
+   */
+  onModelSwitch?: (modelId: string, provider: string, attempt: number) => void;
 }
 
 const MODEL_CATALOGS: Record<string, { id: string; name: string; contextWindow: number; supportsTools: boolean }[]> = {
@@ -42,6 +50,57 @@ const MODEL_CATALOGS: Record<string, { id: string; name: string; contextWindow: 
 
 export function getModelCatalog(provider: string) {
   return MODEL_CATALOGS[provider] || [];
+}
+
+/**
+ * Detect content refusals ("policy blocks") in a model's reply.
+ *
+ * A refusal is NOT a technical error (HTTP 429/5xx): the request succeeded but
+ * the model declined to answer. Without this check the fallback chain would
+ * never kick in on refusals and the user would get an empty/useless answer
+ * from the primary model. Detection is language-aware (English + German) and
+ * deliberately conservative — it only fires when the message STARTS with a
+ * clear refusal phrase, so answers that merely *mention* safety policies are
+ * not misclassified.
+ */
+const REFUSAL_PATTERNS = [
+  /^(?:i'?m|i am)\s+sorry[,.\s]+(?:but\s+)?i\s+(?:can'?t|cannot|am unable|won'?t)\b/i,
+  /^i\s+(?:can'?t|cannot|am unable to|won'?t|do n'?t|don'?t)\s+(?:be able to\s+)?(?:help|assist|answer|respond|comply|provide|discuss|engage)/i,
+  /^i\s+(?:must|have to)\s+decline\b/i,
+  /^as an ai[,.]?\s+i\s+(?:can'?t|cannot|don'?t|do not|am not able|am unable)/i,
+  /^i\s+(?:'?m|am)\s+(?:unable|not able|not permitted|not allowed)\s+to\b/i,
+  /^i\s+(?:'?m|am)\s+(?:designed|programmed|required)\s+to\s+(?:follow|respect|adhere)\b/i,
+  // OpenAI-style moderation refusal signal
+  /content_policy_violation|new_sensitive_unavailable_content/i,
+  // German refusal phrases
+  /^leider\s+(?:kann|darf|muss)\b/i,
+  /^(?:als\s+ki|als\s+sprachmodell)\s+kann\s+ich\s+(?:nicht|leider)/i,
+  /^das\s+(?:liegt\s+nicht\s+in\s+meinen?\s+(?:aufgaben|fähigkeiten)|fällt\s+außerhalb)/i,
+];
+
+export function detectRefusal(content: string): boolean {
+  const text = (content || '').trim();
+  if (!text) return false;
+  for (const re of REFUSAL_PATTERNS) {
+    if (re.test(text)) return true;
+  }
+  return false;
+}
+
+/** Error thrown when a model answers but refuses the request (content policy). */
+export class ModelRefusalError extends Error {
+  readonly refusal = true as const;
+  readonly refusedModel: string;
+  readonly refusedProvider: string;
+  readonly refusedContent: string;
+
+  constructor(model: string, provider: string, content: string) {
+    super(`Model "${model}" refused the request (likely content policy); trying fallback…`);
+    this.name = 'ModelRefusalError';
+    this.refusedModel = model;
+    this.refusedProvider = provider;
+    this.refusedContent = content;
+  }
 }
 
 export function getAllModels() {
@@ -103,13 +162,24 @@ export async function callProvider(
   ].filter((m): m is ModelConfig => !!m);
 
   let lastError: Error | null = null;
+  // Refusal tracking: if EVERY model in the chain refused the request (content
+  // policy) instead of failing technically, the caller should be able to tell
+  // "all models declined" apart from "all models errored" — and must NOT treat
+  // a refusal as a reason to re-run work that was already completed.
+  let sawRefusal = false;
 
-  for (const config of modelConfigs) {
+  for (let attemptIdx = 0; attemptIdx < modelConfigs.length; attemptIdx++) {
+    const config = modelConfigs[attemptIdx];
     const apiKey = getApiKey(settings, config.provider);
     if (!apiKey) {
       lastError = new Error(`API key not configured for ${config.provider}`);
       continue;
     }
+
+    // Tell the caller which model is taking over BEFORE any tokens are
+    // streamed. On fallback this lets the UI reset its per-attempt buffer and
+    // attribute the answer to the right model instead of the one that refused.
+    callbacks?.onModelSwitch?.(config.modelId, config.provider, attemptIdx + 1);
 
     let reservationId: string | null = null;
     try {
@@ -137,6 +207,21 @@ export async function callProvider(
         config, apiKey, messages, tools, callbacks, abortSignal, settings
       );
 
+      // Refusal check: the call technically succeeded (HTTP 200) but the model
+      // declined to answer. Treat it like a failed attempt so the NEXT model
+      // in the fallback chain answers the SAME request with the SAME message
+      // history — already completed work (tool results, earlier steps) stays
+      // part of the conversation and is NOT re-run from scratch.
+      if (detectRefusal(result.content)) {
+        // The refusing model consumed budget; account for its real usage
+        // before handing over to the fallback.
+        tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
+        reservationId = null;
+        await recordTokenUsage({ ...result.usage, provider: config.provider, model: config.modelId });
+        sawRefusal = true;
+        throw new ModelRefusalError(config.modelId, config.provider, result.content);
+      }
+
       // Update TPM with actual usage AND release this request's reservation in
       // one step. Previously the reservation was never released on success, so
       // its tokens were double-counted (reserved + used) until the 30s expiry.
@@ -152,9 +237,16 @@ export async function callProvider(
         reservationId = null;
       }
       if (err.name === 'AbortError') throw err;
-      
+
       lastError = err;
-      
+
+      // Refusal by this model -> hand the SAME request (identical message
+      // history, incl. tool results from earlier steps) to the next model in
+      // the chain instead of restarting the task from scratch.
+      if (err.refusal === true || err instanceof ModelRefusalError) {
+        continue;
+      }
+
       // Check if error is retryable
       if (err.status === 401 || err.status === 403) {
         throw new Error(`Authentication failed for ${config.provider}. Check your API key.`);
@@ -173,6 +265,18 @@ export async function callProvider(
       // For other errors, also try fallback
       continue;
     }
+  }
+
+  // If at least one model refused and none answered, mark the final error as a
+  // refusal so callers can distinguish "every model declined" (don't blindly
+  // retry / redo work) from "infrastructure failure" (safe to resume/retry).
+  if (sawRefusal && !(lastError as any)?.refusal) {
+    const refusalErr: any = new Error(
+      'All configured models declined this request (content policy). The task was not restarted — progress is preserved.'
+    );
+    refusalErr.refusal = true;
+    refusalErr.name = 'ModelRefusalError';
+    throw refusalErr;
   }
 
   throw lastError || new Error('All models failed');
