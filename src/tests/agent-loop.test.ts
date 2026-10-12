@@ -141,4 +141,35 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
     const skipped = step2.find((m: any) => m.role === 'tool' && m.tool_call_id === 'x5');
     expect(JSON.parse(skipped.content).skipped).toContain('Budget');
   });
+
+  it('stops the loop with a synthesis answer once the tool budget is exhausted (no wasted round-trips)', async () => {
+    // Regression: after the per-turn tool budget was spent, the loop kept
+    // iterating until maxToolSteps — every extra provider call re-billed the
+    // whole history for answers that were then discarded by the max-steps
+    // fallback. Now exactly ONE final synthesis call (with tools disabled)
+    // must run and its text becomes the persisted final answer.
+    const calls = [1, 2, 3, 4].map(n => sseCall(`b${n}`, 'calculator', { expression: `${n}+0` }));
+    scriptSteps([
+      { content: 'Ich rechne.', toolCalls: calls },   // step 1: budget fully used
+      { content: 'Finale Antwort aus gesammeltem Material.' }, // synthesis call
+    ]);
+
+    const completed: any[] = [];
+    await new ChatOrchestrator().sendMessage(settings, makeSession(), undefined, {
+      onToken: () => {}, onToolCall: () => {}, onToolResult: () => {},
+      onComplete: (m: any) => completed.push(m), onError: () => {}, onStatus: () => {},
+    });
+
+    // Exactly two provider calls: the tool step + ONE synthesis call — not 10.
+    expect(mockedCall).toHaveBeenCalledTimes(2);
+    // The synthesis call must NOT offer tools (forcing a text answer).
+    expect(mockedCall.mock.calls[1][2]).toBeUndefined();
+    // The synthesis prompt carries the budget nudge from the loop.
+    const synthPrompt = promptAt(1);
+    expect(synthPrompt.some((m: any) => m.role === 'user' && m.content.includes('Tool-Budget erschöpft'))).toBe(true);
+    // Final message contains BOTH the planning step text and the synthesis answer.
+    expect(completed).toHaveLength(1);
+    expect(completed[0].content).toContain('Ich rechne.');
+    expect(completed[0].content).toContain('Finale Antwort aus gesammeltem Material.');
+  });
 });
