@@ -148,6 +148,16 @@ export class ChatOrchestrator {
   private abortController: AbortController | null = null;
   private toolCallCount = 0;
   private maxToolSteps = 20;
+  /**
+   * Hard cap on EXECUTED tool calls per turn. The system prompt asks for ≤3,
+   * but prompts are only advice — without a runtime limit a model can fire off
+   * dozens of searches in one turn (observed: 8 tool calls + ~43k tokens for
+   * the single question "wieviel kostet eine Siemens Aktie?"). Every extra
+   * step re-sends all prior tool results as prompt tokens, so this cap is the
+   * main defence against runaway token spend. When reached, the loop stops
+   * calling tools and forces the model to answer from what it already has.
+   */
+  private maxToolCallsPerTurn = 6;
   private processedToolCalls = new Set<string>();
   /** Content streamed during the current turn (kept for abort persistence). */
   private partialContent = '';
@@ -357,6 +367,9 @@ export class ChatOrchestrator {
     // exact same call across steps, which wastes both execution time and
     // prompt tokens for the duplicated results.
     const seenToolSignatures = new Set<string>();
+    // One retry is allowed when a model returns a completely empty reply
+    // (no text, no tools) before anything was accomplished this turn.
+    let emptyRetryUsed = false;
 
     // Replay completed work from a previously interrupted turn: if the last
     // assistant message is an interruption marker that carries tool calls AND
@@ -461,8 +474,21 @@ export class ChatOrchestrator {
         };
       }
 
-      // If no tool calls, we're done
+      // If no tool calls, we're done — UNLESS the reply is empty AND nothing
+      // was researched yet: that is a "silent refusal" (the model answered
+      // with neither text nor tools), not an answer. Ending here would show
+      // the user a blank message after already burning tokens on earlier
+      // steps; instead feed the model one explicit nudge to answer now.
       if (toolCalls.length === 0) {
+        const hasProgress = turnToolCalls.length > 0 || fullContent.trim().length > 0;
+        if (!assistantContent.trim() && !hasProgress && !emptyRetryUsed) {
+          emptyRetryUsed = true;
+          messages.push({
+            role: 'user',
+            content: 'Deine vorherige Antwort war leer (kein Text, kein Tool-Aufruf). Antworte JETZT direkt und vollständig auf die ursprüngliche Nutzerfrage, ggf. mit den bereits im Verlauf vorhandenen Tool-Ergebnissen.',
+          });
+          continue;
+        }
         const finalMessage: ChatMessage = {
           id: crypto.randomUUID(),
           role: 'assistant',
