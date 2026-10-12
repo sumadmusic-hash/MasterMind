@@ -15,6 +15,12 @@ export interface StreamCallbacks {
   onToolCall: (toolCall: any) => void;
   onComplete: (fullContent: string, usage: TokenUsage) => void;
   onError: (error: Error) => void;
+  /**
+   * Optional: fired while the request waits for the TPM budget to free up
+   * (waitMs = estimated pause until the next attempt, waitedMs = total time
+   * already spent waiting). Lets the UI show progress instead of looking stuck.
+   */
+  onBudgetWait?: (waitMs: number, waitedMs: number) => void;
 }
 
 const MODEL_CATALOGS: Record<string, { id: string; name: string; contextWindow: number; supportsTools: boolean }[]> = {
@@ -110,9 +116,15 @@ export async function callProvider(
       const maxOutput = settings.maxTokensPerRequest;
       const totalEstimated = estimatedTokens + maxOutput;
 
-      reservationId = await tpmManager.reserve(config.provider, totalEstimated, settings);
+      reservationId = await tpmManager.reserveAndWait(config.provider, totalEstimated, settings, {
+        signal: abortSignal,
+        onWait: (waitMs, waitedMs) => callbacks?.onBudgetWait?.(waitMs, waitedMs),
+      });
       if (!reservationId) {
-        lastError = new Error('Token budget exhausted. Please wait or increase limits.');
+        // Budget stays configurable via Settings; this only happens when the
+        // wait window elapsed, the request can never fit the limits, or the
+        // user aborted while waiting.
+        lastError = new Error(`Token budget (${settings.globalTpmLimit.toLocaleString()} TPM) still exhausted after waiting — try again later or raise the limit in Settings.`);
         continue;
       }
 

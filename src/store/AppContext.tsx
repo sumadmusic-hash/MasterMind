@@ -95,6 +95,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           maxTokensPerRequest: 4096,
           maxToolSteps: 20,
           maxCallDuration: 120000,
+          tpmWaitTimeoutMs: 300000,
           theme: 'dark',
         };
         dispatch({ type: 'SET_SETTINGS', payload: defaults });

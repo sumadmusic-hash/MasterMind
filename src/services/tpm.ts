@@ -35,6 +35,98 @@ class TokenPerMinuteManager {
     return () => { this.listeners.delete(listener); };
   }
 
+  /**
+   * Estimate how long until `tokens` more tokens become available in the
+   * rolling window — used to compute a smart sleep interval while waiting,
+   * instead of busy-polling. If nothing is currently in flight, the full
+   * 60s window must elapse before usage drops off; otherwise we wait for
+   * the oldest in-flight entries to age out and re-check.
+   */
+  private estimateWaitMs(tokens: number): number {
+    const inflight = [...this.usageLog.values()].sort((a, b) => a.timestamp - b.timestamp);
+    if (inflight.length === 0) return this.windowMs;
+    // Walk oldest-first until enough tokens would be freed by aging out
+    let freed = 0;
+    for (const entry of inflight) {
+      freed += entry.tokens;
+      if (freed >= tokens) {
+        const remaining = Math.max(1000, entry.timestamp + this.windowMs - Date.now());
+        return Math.min(remaining, this.windowMs);
+      }
+    }
+    return this.windowMs;
+  }
+
+  /**
+   * Reserve tokens, WAITING until the budget frees up instead of failing.
+   * This is what lets a task that exceeds the tokens-per-minute limit still
+   * get processed: the request simply pauses until the sliding window has
+   * enough room. Already-completed work (prior agent steps, streamed text)
+   * lives in the caller's state and is never discarded while waiting.
+   *
+   * Resolves with the reservation id as soon as the tokens can be reserved,
+   * or `null` when:
+   *  - `waitTimeoutMs` elapses without the budget freeing up, or
+   *  - the request is fundamentally too large for the configured limits
+   *    (waiting would never help), or
+   *  - the abort signal fires while waiting.
+   *
+   * `onWait` is invoked before each pause with the estimated retry delay so
+   * the UI can show "Waiting for token budget..." instead of appearing stuck.
+   */
+  async reserveAndWait(
+    provider: string,
+    tokens: number,
+    settings: AppSettings,
+    opts: { waitTimeoutMs?: number; onWait?: (waitMs: number, waitedMs: number) => void; signal?: AbortSignal } = {}
+  ): Promise<string | null> {
+    const waitTimeoutMs = opts.waitTimeoutMs ?? settings.tpmWaitTimeoutMs ?? 300000;
+
+    // Fast path: budget is free right now.
+    const immediate = await this.reserve(provider, tokens, settings);
+    if (immediate) return immediate;
+
+    // The blocked attempt above may have left a timed-out reservation behind
+    // that still occupies budget — drop it so our own wait doesn't compete
+    // with a stale entry of the very same request.
+    this.releaseReservation(provider);
+
+    // Distinguish "temporarily full" from "never fits": if even an empty
+    // window couldn't accommodate this request, waiting is pointless.
+    const perProviderLimit = this.budget.perProvider[provider]?.limit;
+    const impossible =
+      tokens > this.budget.globalLimit ||
+      (perProviderLimit !== undefined && tokens > perProviderLimit) ||
+      tokens > settings.maxTokensPerRequest * 2;
+    if (impossible) return null;
+
+    if (waitTimeoutMs <= 0) return null;
+
+    const deadline = Date.now() + waitTimeoutMs;
+    while (Date.now() < deadline) {
+      if (opts.signal?.aborted) return null;
+
+      const waitMs = Math.min(this.estimateWaitMs(tokens), deadline - Date.now());
+      opts.onWait?.(Math.max(0, waitMs), Date.now() - (deadline - waitTimeoutMs));
+
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(finish, Math.max(250, waitMs));
+        function finish() {
+          clearTimeout(timer);
+          opts.signal?.removeEventListener('abort', finish);
+          resolve();
+        }
+        opts.signal?.addEventListener('abort', finish, { once: true });
+      });
+
+      if (opts.signal?.aborted) return null;
+
+      const attempt = await this.reserve(provider, tokens, settings);
+      if (attempt) return attempt;
+    }
+    return null;
+  }
+
   constructor() {
     this.budget = {
       globalLimit: 100000,
@@ -245,6 +337,21 @@ class TokenPerMinuteManager {
 
   getUsageHistory(): { provider: string; tokens: number; timestamp: number }[] {
     return [...this.usageLog];
+  }
+
+  /**
+   * Test/utility hook: drop all recorded usage as if the sliding window had
+   * fully elapsed ("wieder geht es" ohne 60s Realtime-Warten). Reservations
+   * are kept so in-flight requests stay accounted for.
+   */
+  clearWindow(): void {
+    this.usageLog = [];
+    this.budget.usedInWindow = 0;
+    this.budget.windowStart = Date.now();
+    for (const provider of Object.keys(this.budget.perProvider)) {
+      this.budget.perProvider[provider].used = 0;
+    }
+    this.notifyIfChanged();
   }
 }
 

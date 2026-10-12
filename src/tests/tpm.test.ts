@@ -9,6 +9,7 @@ const mockSettings: AppSettings = {
   maxTokensPerRequest: 4096,
   maxToolSteps: 20,
   maxCallDuration: 120000,
+  tpmWaitTimeoutMs: 300000,
   theme: 'dark',
 };
 
@@ -77,5 +78,82 @@ describe('TokenPerMinuteManager', () => {
     tpmManager.releaseReservation('groq');
     const after = tpmManager.getRemaining();
     expect(after).toBeGreaterThan(before);
+  });
+
+  describe('reserveAndWait (TPM limit exceeded -> wait, not fail)', () => {
+    it('reserves immediately when budget is free', async () => {
+      const id = await tpmManager.reserveAndWait('groq', 1000, mockSettings);
+      expect(id).toBeTruthy();
+    });
+
+    it('waits until the budget frees up instead of failing', async () => {
+      // Fill the window completely so a new request cannot reserve right now
+      tpmManager.recordUsage('groq', 99000);
+
+      let waitNotified = false;
+      const pending = tpmManager.reserveAndWait(
+        'groq',
+        2000,
+        { ...mockSettings, tpmWaitTimeoutMs: 3000 },
+        { onWait: () => { waitNotified = true; } }
+      );
+
+      // While waiting, the task must NOT be rejected — it stays pending.
+      let resolved = false;
+      pending.then(() => { resolved = true; });
+      await new Promise(r => setTimeout(r, 50));
+      expect(resolved).toBe(false);
+      expect(waitNotified).toBe(true);
+
+      // Simulate "wieder geht es": the used tokens age out of the window
+      // (equivalent to the sliding window freeing up after 60s). Also drop
+      // the reservation that the blocked first attempt left behind, so the
+      // waiter succeeds on its next retry instead of only at timeout.
+      tpmManager.clearWindow();
+      tpmManager.releaseReservation('groq');
+      // The waiter retries at its scheduled time and should succeed within
+      // the 3s wait window.
+      const id = await pending;
+      expect(id).toBeTruthy();
+    });
+
+    it('gives up after the wait timeout elapses', async () => {
+      // Window permanently full and can't be freed within the tiny timeout
+      tpmManager.recordUsage('groq', 99000);
+      const start = Date.now();
+      const id = await tpmManager.reserveAndWait(
+        'groq',
+        2000,
+        { ...mockSettings, tpmWaitTimeoutMs: 700 }
+      );
+      expect(id).toBeNull();
+      expect(Date.now() - start).toBeGreaterThanOrEqual(600);
+    });
+
+    it('returns null without waiting when the request can never fit the limit', async () => {
+      const start = Date.now();
+      const id = await tpmManager.reserveAndWait(
+        'groq',
+        200000, // larger than globalTpmLimit
+        { ...mockSettings, tpmWaitTimeoutMs: 60000 }
+      );
+      expect(id).toBeNull();
+      // "Impossible" requests must fail fast, not stall the task
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+
+    it('stops waiting when the abort signal fires', async () => {
+      tpmManager.recordUsage('groq', 99000);
+      const controller = new AbortController();
+      const pending = tpmManager.reserveAndWait(
+        'groq',
+        2000,
+        { ...mockSettings, tpmWaitTimeoutMs: 60000 },
+        { signal: controller.signal }
+      );
+      setTimeout(() => controller.abort(), 100);
+      const id = await pending;
+      expect(id).toBeNull();
+    });
   });
 });

@@ -69,6 +69,18 @@ export class ChatOrchestrator {
         callbacks.onStatus('Aborted by user');
         return;
       }
+      // Budget-wait failures must not discard progress either: persist the
+      // partial turn (user message, streamed text, completed tool steps) so a
+      // retry can build on it instead of starting over.
+      if (this.partialContent.trim().length > 0) {
+        this.appendMessage(session, {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: this.partialContent + `\n\n*(Prozess angehalten: ${err.message || 'Fehler'})*`,
+          timestamp: Date.now(),
+        });
+        await saveChatSession(session);
+      }
       callbacks.onError(err.message || 'An error occurred');
       await addLog({ level: 'error', message: `Chat error: ${err.message}`, timestamp: Date.now() });
     }
@@ -141,6 +153,17 @@ export class ChatOrchestrator {
             },
             onError: (err: Error) => {
               callbacks.onError(err.message);
+            },
+            // TPM budget exhausted: don't fail the task — callProvider waits
+            // internally until tokens free up. Surface the wait as status so
+            // the user sees progress instead of a stuck UI; completed steps
+            // and streamed text stay intact while waiting.
+            onBudgetWait: (waitMs, waitedMs) => {
+              const secs = Math.max(1, Math.round(waitMs / 1000));
+              const waited = Math.round(waitedMs / 1000);
+              callbacks.onStatus(
+                `Token-Limit erreicht – warte auf Budget (${secs}s${waited > 0 ? `, wartet seit ${waited}s` : ''})…`
+              );
             },
           },
           this.abortController?.signal

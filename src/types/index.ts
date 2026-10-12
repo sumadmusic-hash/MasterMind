@@ -22,6 +22,10 @@ export const AppSettingsSchema = z.object({
   maxTokensPerRequest: z.number().default(4096),
   maxToolSteps: z.number().default(20),
   maxCallDuration: z.number().default(120000),
+  // When the TPM budget is exhausted, tasks WAIT instead of failing. This
+  // bounds how long a single request may wait for budget to free up
+  // (default 5 minutes). Set to 0 to fail immediately instead of waiting.
+  tpmWaitTimeoutMs: z.number().min(0).default(300000),
   theme: z.enum(['light', 'dark', 'system']).default('dark'),
 });
 export type AppSettings = z.infer<typeof AppSettingsSchema>;
