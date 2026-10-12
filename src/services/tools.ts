@@ -2,6 +2,41 @@ import type { ToolDefinition, ToolCall, ToolResult, Source } from '../types';
 import { getSettings } from './database';
 
 /**
+ * Per-turn marker for scheduler-initiated executions (set by AppContext via
+ * `__setManualMarkerForTests`-style injection in scheduler.ts). Tools that
+ * WRITE persistent state (memory, positions, scheduled jobs) refuse to run
+ * inside an automated background run unless the job explicitly opts in with
+ * `allowInScheduledRun: true` — a cron-triggered workflow must never silently
+ * rewrite the user's memory or depot.
+ */
+let currentExecutionOrigin: 'user' | 'scheduled' = 'user';
+export function setExecutionOrigin(origin: 'user' | 'scheduled'): void {
+  currentExecutionOrigin = origin;
+}
+export function getExecutionOrigin(): 'user' | 'scheduled' {
+  return currentExecutionOrigin;
+}
+
+/** Throwing guard used by all write-capable tools registered after Phase 1. */
+function assertInteractive(args: any): void {
+  if (currentExecutionOrigin === 'scheduled' && args?.allowInScheduledRun !== true) {
+    throw new Error(
+      'Blockiert: Dieser Schreibzugriff läuft in einem automatisierten Scheduler-Run. ' +
+      'Für geplante Jobs bewusst nur lesende Tools verwenden oder im Job `allowInScheduledRun: true` setzen.'
+    );
+  }
+}
+
+/**
+ * True when the CURRENT turn was started by the scheduler (not the user).
+ * Used by chat.ts to disable interactive features (e.g. automatic memory
+ * injection) during background runs.
+ */
+export function isScheduledRunActive(): boolean {
+  return currentExecutionOrigin === 'scheduled';
+}
+
+/**
  * Reject unknown / misspelled argument names instead of silently ignoring them.
  * LLMs happily invent parameters (`{ locationg: "Berlin" }`), which used to
  * produce empty results and made the model retry the same broken call over and
@@ -260,6 +295,200 @@ export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8):
   }
   return data;
 }
+
+// ============ Pure helpers (unit-testable, no browser APIs) ============
+
+/** Basic statistics over a numeric series (used by macro_series & portfolio). */
+export function seriesStats(values: number[]): {
+  count: number; last: number | null; min: number | null; max: number | null;
+  mean: number | null; changePercent: number | null; firstDateDeltaDays: number | null;
+} {
+  const nums = values.filter(v => Number.isFinite(v));
+  if (nums.length === 0) {
+    return { count: 0, last: null, min: null, max: null, mean: null, changePercent: null, firstDateDeltaDays: null };
+  }
+  const first = nums[0];
+  const last = nums[nums.length - 1];
+  const mean = nums.reduce((a, b) => a + b, 0) / nums.length;
+  return {
+    count: nums.length,
+    last,
+    min: Math.min(...nums),
+    max: Math.max(...nums),
+    mean,
+    changePercent: first !== 0 ? ((last - first) / Math.abs(first)) * 100 : null,
+    firstDateDeltaDays: null,
+  };
+}
+
+/** Downsample a [{date,value}] series to at most `maxPoints` (keeps first+last). */
+export function downsample<T extends { date: string }>(points: T[], maxPoints = 60): T[] {
+  if (points.length <= maxPoints || maxPoints < 2) return points;
+  const step = Math.ceil(points.length / maxPoints);
+  const out: T[] = [];
+  for (let i = 0; i < points.length; i += step) out.push(points[i]);
+  if (out[out.length - 1] !== points[points.length - 1]) out.push(points[points.length - 1]);
+  return out;
+}
+
+/**
+ * Parse FRED's `fredgraph.csv` format: header `observation_date,DGS10` with
+ * missing values encoded as ".". Returns only finite observations.
+ */
+export function parseFredCsv(text: string): { unit: string | undefined; points: { date: string; value: number }[] } {
+  const lines = String(text || '').split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length < 2) return { unit: undefined, points: [] };
+  const header = lines[0].split(',');
+  const unit = (header[1] || '').trim() || undefined;
+  const points: { date: string; value: number }[] = [];
+  for (const line of lines.slice(1)) {
+    const idx = line.indexOf(',');
+    if (idx < 0) continue;
+    const date = line.slice(0, idx).trim();
+    const raw = line.slice(idx + 1).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+    const value = Number(raw);
+    if (raw === '.' || !Number.isFinite(value)) continue;
+    points.push({ date, value });
+  }
+  return { unit, points };
+}
+
+/**
+ * Parse a CSV file into rows of objects using the header row as keys.
+ * Handles quoted fields and escaped quotes ("" inside "...").
+ */
+export function parseCsv(text: string): { headers: string[]; rows: Record<string, string>[]; skippedLines: number } {
+  const src = String(text || '');
+  const rowsRaw: string[][] = [];
+  let field = '';
+  let row: string[] = [];
+  let inQuotes = false;
+  let i = 0;
+  const endField = () => { row.push(field); field = ''; };
+  const endRow = () => { endField(); rowsRaw.push(row); row = []; };
+  while (i < src.length) {
+    const ch = src[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (src[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += ch; i++; continue;
+    }
+    if (ch === '"') { inQuotes = true; i++; continue; }
+    if (ch === ',') { endField(); i++; continue; }
+    if (ch === '\r') { i++; continue; }
+    if (ch === '\n') { endRow(); i++; continue; }
+    field += ch; i++;
+  }
+  if (field.length > 0 || row.length > 0) endRow();
+
+  const nonEmpty = rowsRaw.filter(r => r.some(c => c.trim() !== ''));
+  if (nonEmpty.length === 0) return { headers: [], rows: [], skippedLines: 0 };
+  const headers = nonEmpty[0].map(h => h.trim());
+  const rows: Record<string, string>[] = [];
+  let skipped = 0;
+  for (const r of nonEmpty.slice(1)) {
+    if (r.length !== headers.length) { skipped++; continue; }
+    const obj: Record<string, string> = {};
+    headers.forEach((h, idx) => { obj[h] = r[idx].trim(); });
+    rows.push(obj);
+  }
+  return { headers, rows, skippedLines: skipped };
+}
+
+/** Serialize an array of flat objects into CSV (first object decides columns). */
+export function toCsv(rows: Record<string, any>[], columns?: string[]): string {
+  if (!Array.isArray(rows) || rows.length === 0) return '';
+  const cols = columns && columns.length ? columns : Object.keys(rows[0]);
+  const esc = (v: any): string => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [cols.join(',')];
+  for (const r of rows) lines.push(cols.map(c => esc(r?.[c])).join(','));
+  return lines.join('\n');
+}
+
+/**
+ * Resolve a dot/bracket path against parsed JSON, e.g. `data.series[0].values`
+ * or `meta["obs time"]`. Returns undefined when any segment is missing —
+ * never throws, so a wrong path costs one retry, not a crashed chain.
+ */
+export function jsonPath(obj: any, path: string): any {
+  if (!path) return obj;
+  const segments: (string | number)[] = [];
+  const re = /\.([^.\[\]]+)|\[(\d+)\]|\["([^"]+)"\]/g;
+  let m: RegExpExecArray | null;
+  let consumed = 0;
+  const leading = path.startsWith('$.') ? 2 : path.startsWith('$') ? 1 : 0;
+  const body = path.slice(leading);
+  if (body.length === 0) return obj;
+  // Simple split fallback for plain dotted paths without brackets.
+  if (!/[\[\]]/.test(body)) return body.split('.').reduce((acc: any, key: string) => acc?.[key], obj);
+  while ((m = re.exec(body)) !== null) {
+    if (m.index !== consumed) return undefined; // malformed segment
+    if (m[1] !== undefined) segments.push(m[1]);
+    else if (m[2] !== undefined) segments.push(Number(m[2]));
+    else if (m[3] !== undefined) segments.push(m[3]);
+    consumed = re.lastIndex;
+  }
+  if (consumed !== body.length) return undefined;
+  return segments.reduce((acc: any, seg) => acc?.[seg], obj);
+}
+
+/**
+ * Minimal linear-regression trend for two aligned series (x = dates of a,
+ * y = values of b matched by date). Used by chart_generator's optional
+ * `trendline` flag and by correlation questions like "Zinsen vs. Inflation".
+ */
+export function alignSeriesByDate(
+  a: { date: string; value: number }[],
+  b: { date: string; value: number }[]
+): { dates: string[]; x: number[]; y: number[] } {
+  const mapB = new Map(b.map(p => [p.date, p.value]));
+  const dates: string[] = [];
+  const x: number[] = [];
+  const y: number[] = [];
+  for (const p of a) {
+    if (mapB.has(p.date)) {
+      dates.push(p.date);
+      x.push(p.value);
+      y.push(mapB.get(p.date)!);
+    }
+  }
+  return { dates, x, y };
+}
+
+export function linearRegression(x: number[], y: number[]): { slope: number; intercept: number; r2: number } | null {
+  const n = Math.min(x.length, y.length);
+  if (n < 2) return null;
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += x[i]; sy += y[i];
+    sxx += x[i] * x[i]; syy += y[i] * y[i];
+    sxy += x[i] * y[i];
+  }
+  const denomX = n * sxx - sx * sx;
+  if (denomX === 0) return null;
+  const slope = (n * sxy - sx * sy) / denomX;
+  const intercept = (sy - slope * sx) / n;
+  const denomY = n * syy - sy * sy;
+  const r2 = denomX === 0 || denomY === 0 ? 0 : Math.pow(n * sxy - sx * sy, 2) / (denomX * denomY);
+  return { slope, intercept, r2 };
+}
+
+/** Validate a schedule spec (see scheduler.ts) without importing it (no cycle). */
+export function isValidScheduleSpec(spec: string): boolean {
+  const s = String(spec || '').trim().toLowerCase();
+  if (['@hourly', '@daily', '@weekly'].includes(s)) return true;
+  const m = /^(\d+)\s*([mhd])$/.exec(s);
+  if (!m) return false;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 && n * (m[2] === 'm' ? 60_000 : m[2] === 'h' ? 3600_000 : 86400_000) >= 60_000;
+}
+
 
 // ============ Built-in Tool Implementations ============
 
@@ -2316,4 +2545,718 @@ function dedupeStrings(values: string[]): string[] {
   }
   return out;
 }
+
+// ============================================================================
+// Phase 1+2 Tools (docs/fehlende-tools-mehr-macht.md)
+// user_memory, macro_data, portfolio_tracking, scheduler, chart_generator,
+// export_file / import_file. Alle clientseitig; Schreib-Tools sind per
+// assertInteractive() gegen automatische Scheduler-Läufe geschützt.
+// ============================================================================
+
+import {
+  saveMemory, searchMemories, listMemories, deleteMemory,
+  upsertPosition, getPositions, deletePosition,
+  getCachedSeries, putCachedSeries,
+  getScheduledJobs, saveScheduledJob, deleteScheduledJob,
+} from './database';
+import type { MemoryEntry, PortfolioPosition, ScheduledJob } from '../types';
+
+// ---- memory_save (user_memory) --------------------------------------------
+toolRegistry.register({
+  id: 'memory_save',
+  name: 'Memory Save',
+  description:
+    'Dauerhaften Nutzer-Kontext persistieren: Präferenzen ("antwortet gern auf Deutsch"), Positionen im Depot, ' +
+    'Watchlist-Ticker, stabile Fakten. Wird in künftigen Gesprächen automatisch dem System-Prompt beigefügt. ' +
+    'NICHT für kurzlebige Infos aus einer einzelnen Recherche verwenden.',
+  category: 'transform',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      key: { type: 'string', description: 'Stabiler Schlüssel, z.B. "sprache", "SAP", "risikoprofil"' },
+      category: { type: 'string', enum: ['preference', 'position', 'watchlist', 'fact'], description: 'Art des Gedächtniseintrags' },
+      content: { type: 'string', description: 'Kurze Aussage (max ~300 Zeichen)' },
+      importance: { type: 'number', description: '0..1 (default 0.5) — steuert Recall-Ranking & Prompt-Budget' },
+      pinned: { type: 'boolean', description: 'true = wird immer in den Prompt injiziert' },
+      allowInScheduledRun: { type: 'boolean', description: 'Nur für Scheduler-Jobs: Schreiben im Hintergrund explizit erlauben' },
+    },
+    required: ['key', 'category', 'content'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 5000,
+  builtin: true,
+}, async (args) => {
+  assertInteractive(args);
+  const content = String(args.content || '').trim();
+  if (!content) throw new Error('Parameter "content" ist leer.');
+  const entry = await saveMemory({
+    key: String(args.key).trim(),
+    category: args.category,
+    content: content.slice(0, 400),
+    importance: Math.min(Math.max(Number(args.importance ?? 0.5), 0), 1),
+    pinned: args.pinned === true,
+  });
+  return { saved: true, id: entry.id, key: entry.key, category: entry.category, updatedAt: entry.updatedAt };
+});
+
+// ---- memory_recall (user_memory) ------------------------------------------
+toolRegistry.register({
+  id: 'memory_recall',
+  name: 'Memory Recall',
+  description:
+    'Persistiertes Nutzergedächtnis durchsuchen (Präferenzen, Positionen, Watchlist, Fakten). ' +
+    'Nutzen statt zu raten, wenn der Nutzer nach "meinem Depot"/"letzten Absprachen" fragt.',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Stichwort, z.B. "Depot", "SAP", "Sprache"' },
+      category: { type: 'string', enum: ['preference', 'position', 'watchlist', 'fact'], description: 'Optional einschränken' },
+      limit: { type: 'number', description: 'Max Treffer (default 10)' },
+    },
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 20000,
+  builtin: true,
+}, async (args) => {
+  const query = String(args.query || '');
+  const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 50);
+  const hits: MemoryEntry[] = query.trim()
+    ? await searchMemories(query, args.category, limit)
+    : (await listMemories(args.category)).slice(0, limit);
+  return {
+    count: hits.length,
+    memories: hits.map(m => ({ key: m.key, category: m.category, content: m.content, pinned: m.pinned, updatedAt: m.updatedAt })),
+  };
+});
+
+// ---- memory_forget (user_memory) ------------------------------------------
+toolRegistry.register({
+  id: 'memory_forget',
+  name: 'Memory Forget',
+  description: 'Einen Eintrag aus dem Nutzergedächtnis löschen (id oder category+key angeben). Auf ausdrücklichen Nutzerwunsch.',
+  category: 'transform',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'Direkte ID des Eintrags' },
+      category: { type: 'string', enum: ['preference', 'position', 'watchlist', 'fact'] },
+      key: { type: 'string', description: 'Schlüssel des Eintrags (mit category)' },
+      allowInScheduledRun: { type: 'boolean' },
+    },
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 2000,
+  builtin: true,
+}, async (args) => {
+  assertInteractive(args);
+  if (args.id) {
+    await deleteMemory(String(args.id));
+    return { deleted: true, id: args.id };
+  }
+  if (args.category && args.key) {
+    const all = await listMemories(String(args.category));
+    const hit = all.find(m => m.key.toLowerCase() === String(args.key).toLowerCase());
+    if (!hit) return { deleted: false, error: `Kein Eintrag [${args.category}] mit key "${args.key}".` };
+    await deleteMemory(hit.id);
+    return { deleted: true, id: hit.id };
+  }
+  throw new Error('Entweder "id" oder "(category + key)" angeben.');
+});
+
+// ---- macro_series (macro_data) --------------------------------------------
+// FRED delivers historical time series without an API key via the public
+// fredgraph.csv endpoint (CORS-enabled). Cached in IndexedDB (TTL 24h) so
+// repeated questions cost neither rate limits nor prompt tokens.
+const MACRO_TTL_MS = 24 * 3600_000;
+
+toolRegistry.register({
+  id: 'macro_series',
+  name: 'Macro Series',
+  description:
+    'Historische Makro-Zeitreihen (FRED, ohne API-Key): Zinsen (DGS10, FEDFUNDS), Inflation (CPIAUCSL, CPILFESL), ' +
+    'Geldmenge (M2SL), BIP (GDP), Arbeitslosigkeit (UNRATE), Einzelhandel (RSXFS). Liefert kompakte Statistik + ' +
+    'downsamplete Punkte; Ergebnisse werden 24h lokal gecacht. Für "Wie haben sich die 10J-Renditen seit 2022 entwickelt?"',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      seriesId: { type: 'string', description: 'FRED-Serien-ID, z.B. "DGS10", "CPIAUCSL", "FEDFUNDS", "M2SL", "GDP", "UNRATE"' },
+      start: { type: 'string', description: 'Startdatum YYYY-MM-DD (default: vor 5 Jahren)' },
+      end: { type: 'string', description: 'Enddatum YYYY-MM-DD (default: heute)' },
+      frequency: { type: 'string', enum: ['d', 'w', 'm', 'q', 'a'], description: 'Aggregation: daily/weekly/monthly/quarterly/annual (default m)' },
+      maxPoints: { type: 'number', description: 'Max Datenpunkte im Output (default 60)' },
+    },
+    required: ['seriesId'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network', 'storage'],
+  maxDuration: 15000,
+  maxDataSize: 30000,
+  builtin: true,
+}, async (args) => {
+  const seriesId = String(args.seriesId || '').trim().toUpperCase();
+  if (!/^[A-Z0-9_]{2,32}$/.test(seriesId)) {
+    throw new Error(`Ungültige FRED-Serien-ID "${args.seriesId}" (nur Buchstaben/Zahlen/_ , 2–32 Zeichen).`);
+  }
+  const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+  const validDate = (s: any): s is string => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const end = validDate(args.end) ? args.end : isoDay(new Date());
+  const start = validDate(args.start) ? args.start : isoDay(new Date(Date.now() - 5 * 365 * 86400_000));
+  if (start > end) throw new Error('start darf nicht nach end liegen.');
+  const frequency = ['d', 'w', 'm', 'q', 'a'].includes(args.frequency) ? args.frequency : 'm';
+  const maxPoints = Math.min(Math.max(Number(args.maxPoints) || 60, 5), 240);
+
+  const cacheKey = `fred:${seriesId}:${start}:${end}:${frequency}`;
+  const cached = await getCachedSeries(cacheKey, MACRO_TTL_MS);
+  if (cached) {
+    return {
+      source: 'FRED (Cache)', seriesId, unit: cached.unit, from: start, to: end, frequency,
+      points: downsample(cached.points, maxPoints),
+      stats: seriesStats(cached.points.map(p => p.value)),
+      cachedAt: new Date(cached.fetchedAt).toISOString(),
+    };
+  }
+
+  const url = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}&cosd=${start}&coed=${end}&fq=${frequency}&fam=a&vdz=fn`;
+  let text: string;
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!resp.ok) {
+      return { error: `FRED-Antwort ${resp.status} für Serie "${seriesId}". Existiert die ID? (Check: https://fred.stlouisfed.org/series/${seriesId})`, found: false };
+    }
+    text = await resp.text();
+  } catch (err: any) {
+    return { error: `FRED nicht erreichbar (${err?.message || err}). Später erneut versuchen oder web_search nutzen.`, found: false };
+  }
+
+  const { unit, points } = parseFredCsv(text);
+  if (points.length === 0) {
+    return { error: `Serie "${seriesId}" liefert für ${start}..${end} keine Werte (ID prüfen).`, found: false };
+  }
+  await putCachedSeries({
+    id: cacheKey, source: 'fred', seriesId,
+    fetchedAt: Date.now(), expiresAt: Date.now() + MACRO_TTL_MS,
+    unit, points,
+  });
+  return {
+    source: 'FRED (live)', seriesId, unit, from: start, to: end, frequency,
+    observations: points.length,
+    points: downsample(points, maxPoints),
+    stats: seriesStats(points.map(p => p.value)),
+    note: 'Werte in Einheiten der Serie (z.B. % p.a., Index 1982-84=100 bei CPIAUCSL).',
+  };
+});
+
+// ---- portfolio_update (portfolio_tracking) --------------------------------
+toolRegistry.register({
+  id: 'portfolio_update',
+  name: 'Portfolio Update',
+  description:
+    'Eigene Depot-Positionen anlegen/ändern/löschen (ticker, quantity, purchasePrice, currency). ' +
+    'Grundlage für portfolio_overview und persistentes Watchlist-Gedächtnis. Nur lokale Speicherung.',
+  category: 'transform',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['upsert', 'delete'], description: 'upsert = anlegen/aktualisieren, delete = Position entfernen' },
+      ticker: { type: 'string', description: 'Ticker-Symbol, z.B. "SAP", "AAPL", "ETR:SAP" → wird normalisiert' },
+      quantity: { type: 'number', description: 'Anzahl Stücke (>0)' },
+      purchasePrice: { type: 'number', description: 'Einstandskurs pro Stück' },
+      currency: { type: 'string', description: 'ISO-Währung, default EUR' },
+      note: { type: 'string', description: 'Optional Notiz (Strategie, Datum…)' },
+      allowInScheduledRun: { type: 'boolean' },
+    },
+    required: ['action', 'ticker'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 5000,
+  builtin: true,
+}, async (args) => {
+  assertInteractive(args);
+  const ticker = String(args.ticker || '').trim().toUpperCase();
+  if (!/^[A-Z0-9.\-]{1,15}$/.test(ticker)) throw new Error(`Ungültiger Ticker "${args.ticker}".`);
+
+  if (args.action === 'delete') {
+    const positions = await getPositions();
+    const hit = positions.find(p => p.ticker === ticker);
+    if (!hit) return { deleted: false, error: `Keine Position mit Ticker ${ticker}.` };
+    await deletePosition(hit.id);
+    return { deleted: true, ticker };
+  }
+
+  const quantity = Number(args.quantity);
+  const purchasePrice = Number(args.purchasePrice);
+  if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('"quantity" muss eine Zahl > 0 sein.');
+  if (!Number.isFinite(purchasePrice) || purchasePrice < 0) throw new Error('"purchasePrice" muss eine Zahl ≥ 0 sein.');
+  const pos = await upsertPosition({
+    ticker,
+    quantity,
+    purchasePrice,
+    currency: String(args.currency || 'EUR').toUpperCase().slice(0, 3),
+    openedAt: Date.now(),
+    note: args.note ? String(args.note).slice(0, 200) : undefined,
+  });
+  // Keep a mirror in memory so plain chat recall finds it too.
+  await saveMemory({ key: ticker, category: 'position', content: `${pos.quantity} @ ${pos.purchasePrice} ${pos.currency}${pos.note ? ` – ${pos.note}` : ''}`, importance: 0.7, pinned: false });
+  return { saved: true, position: pos };
+});
+
+// ---- portfolio_overview (portfolio_tracking) ------------------------------
+toolRegistry.register({
+  id: 'portfolio_overview',
+  name: 'Portfolio Overview',
+  description:
+    'Alle gespeicherten Positionen mit aktuellem Kurs (Yahoo), G/V je Position und Gesamtsumme. ' +
+    'Für Fragen wie "Wie steht mein Depot?" — ersetzt manuelles Nachschlagen pro Ticker.',
+  category: 'comparison',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      priceSource: { type: 'string', enum: ['yahoo', 'none'], description: 'Aktuelle Kurse mitladen (default yahoo)' },
+    },
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage', 'network'],
+  maxDuration: 20000,
+  maxDataSize: 30000,
+  builtin: true,
+}, async (args) => {
+  const positions: PortfolioPosition[] = await getPositions();
+  if (positions.length === 0) {
+    return { count: 0, positions: [], note: 'Noch keine Positionen — mit portfolio_update anlegen.' };
+  }
+  const wantPrices = args.priceSource !== 'none';
+  const rows: any[] = [];
+  let totalCost = 0, totalValue = 0, priceErrors = 0;
+
+  for (const p of positions) {
+    const cost = p.quantity * p.purchasePrice;
+    totalCost += cost;
+    let current: number | null = null;
+    if (wantPrices) {
+      try {
+        const resp = await fetch(
+          `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(p.ticker)}?range=1d&interval=1d`,
+          { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) }
+        );
+        const json: any = await resp.json();
+        const meta = json?.chart?.result?.[0]?.meta;
+        if (meta && Number.isFinite(meta.regularMarketPrice)) current = meta.regularMarketPrice;
+      } catch { /* keep null */ }
+      if (current == null) priceErrors++;
+    }
+    const value = current != null ? p.quantity * current : cost;
+    totalValue += value;
+    rows.push({
+      ticker: p.ticker, quantity: p.quantity, purchasePrice: p.purchasePrice, currency: p.currency,
+      marketPrice: current,
+      costBasis: round2(cost),
+      marketValue: current != null ? round2(value) : null,
+      pnlAbs: current != null ? round2(value - cost) : null,
+      pnlPercent: current != null && cost > 0 ? round2(((value - cost) / cost) * 100) : null,
+      note: p.note,
+    });
+  }
+
+  rows.sort((a, b) => (b.marketValue ?? b.costBasis) - (a.marketValue ?? a.costBasis));
+  return {
+    count: rows.length,
+    positions: rows,
+    totals: {
+      costBasis: round2(totalCost),
+      marketValue: wantPrices && priceErrors < rows.length ? round2(totalValue) : null,
+      pnlAbs: wantPrices && priceErrors < rows.length ? round2(totalValue - totalCost) : null,
+      pnlPercent: wantPrices && priceErrors < rows.length && totalCost > 0 ? round2(((totalValue - totalCost) / totalCost) * 100) : null,
+    },
+    ...(priceErrors > 0 ? { note: `${priceErrors} von ${rows.length} Kursen nicht abrufbar (Markt geschlossen/Ticker?).` } : {}),
+  };
+});
+
+// NOTE: round2() is defined once above (near the stock tools) and reused here.
+
+// ---- schedule_create / _list / _remove (scheduler) ------------------------
+toolRegistry.register({
+  id: 'schedule_create',
+  name: 'Schedule Create',
+  description:
+    'Regelmäßigen Report-Job anlegen: führt einen bestehenden Workflow in einem Intervall automatisch aus ' +
+    '(Beispiel-Use-Case "jeden Morgen 8 Uhr: EZB + DAX"). Schedule-Syntax: "@daily", "@hourly", "@weekly" oder "<n>m|h|d". ' +
+    'Wichtig: Browser muss offen sein; verpasste Läufe werden beim nächsten Öffnen einmalig nachgeholt.',
+  category: 'workflow',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'Klarer Name, z.B. "Morgenbriefing EZB+DAX"' },
+      schedule: { type: 'string', description: 'Intervall: "@daily" | "@hourly" | "@weekly" | "6h" | "30m" | "2d"' },
+      workflowId: { type: 'string', description: 'ID eines vorhandenen Workflows (siehe Workflows-Seite)' },
+      inputs: { type: 'object', description: 'Optionale Start-Inputs für den Workflow' },
+      allowInScheduledRun: { type: 'boolean' },
+    },
+    required: ['name', 'schedule', 'workflowId'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 5000,
+  builtin: true,
+}, async (args) => {
+  assertInteractive(args);
+  if (!isValidScheduleSpec(String(args.schedule))) {
+    throw new Error(`Ungültiges Schedule "${args.schedule}". Erlaubt: @hourly, @daily, @weekly oder Zahl+m|h|d (min. 1m).`);
+  }
+  const job: ScheduledJob = {
+    id: crypto.randomUUID(),
+    name: String(args.name).slice(0, 80),
+    schedule: String(args.schedule).trim().toLowerCase(),
+    workflowId: String(args.workflowId),
+    inputs: args.inputs && typeof args.inputs === 'object' ? args.inputs : undefined,
+    enabled: true,
+    consecutiveFailures: 0,
+    createdAt: Date.now(),
+  };
+  await saveScheduledJob(job);
+  return { created: true, jobId: job.id, name: job.name, schedule: job.schedule, note: 'Der Scheduler prüft alle 30s; Job erscheint unter Einstellungen → Geplante Jobs.' };
+});
+
+toolRegistry.register({
+  id: 'schedule_list',
+  name: 'Schedule List',
+  description: 'Alle geplanten Jobs anzeigen (Name, Intervall, letzter/nächster Lauf, Status).',
+  category: 'workflow',
+  inputSchema: { type: 'object', properties: {} },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 10000,
+  builtin: true,
+}, async () => {
+  const jobs = await getScheduledJobs();
+  return {
+    count: jobs.length,
+    jobs: jobs.map(j => ({
+      id: j.id, name: j.name, schedule: j.schedule, enabled: j.enabled,
+      lastRun: j.lastRun ? new Date(j.lastRun).toISOString() : null,
+      nextRun: j.nextRun ? new Date(j.nextRun).toISOString() : null,
+      consecutiveFailures: j.consecutiveFailures,
+    })),
+  };
+});
+
+toolRegistry.register({
+  id: 'schedule_remove',
+  name: 'Schedule Remove',
+  description: 'Geplanten Job deaktivieren oder löschen (jobId aus schedule_list).',
+  category: 'workflow',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      jobId: { type: 'string' },
+      hardDelete: { type: 'boolean', description: 'true = vollständig löschen, sonst nur deaktivieren (default)' },
+      allowInScheduledRun: { type: 'boolean' },
+    },
+    required: ['jobId'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 5000,
+  maxDataSize: 2000,
+  builtin: true,
+}, async (args) => {
+  assertInteractive(args);
+  const jobs = await getScheduledJobs();
+  const job = jobs.find(j => j.id === String(args.jobId));
+  if (!job) return { removed: false, error: `Job nicht gefunden: ${args.jobId}` };
+  if (args.hardDelete === true) {
+    await deleteScheduledJob(job.id);
+    return { removed: true, mode: 'deleted', name: job.name };
+  }
+  await saveScheduledJob({ ...job, enabled: false });
+  return { removed: true, mode: 'disabled', name: job.name };
+});
+
+// ---- chart_spec (chart_generator) -----------------------------------------
+toolRegistry.register({
+  id: 'chart_spec',
+  name: 'Chart Spec',
+  description:
+    'Datenvisualisierung erzeugen: validierter Chart-Spec (line/bar/area/pie/scatter) als JSON, das die Chat-Oberfläche ' +
+    'direkt rendert (recharts). Eingabe: categories + series[{name,data[]}] ODER Zeitreihe [{date,value}]. ' +
+    'Ersetzt reine Markdown-Tabellen bei Verläufen/Vergleich.',
+  category: 'report',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      title: { type: 'string' },
+      type: { type: 'string', enum: ['line', 'bar', 'area', 'pie', 'scatter'], description: 'Diagrammtyp (default line)' },
+      categories: { type: 'array', items: { type: 'string' }, description: 'X-Achsen-Beschriftungen (bei categorical Daten)' },
+      series: {
+        type: 'array',
+        items: { type: 'object', properties: { name: { type: 'string' }, data: { type: 'array', items: { type: 'number' } } } },
+        description: 'Eine oder mehrere Datenreihen, gleich lang wie categories',
+      },
+      timeseries: {
+        type: 'array',
+        items: { type: 'object', properties: { date: { type: 'string' }, value: { type: 'number' } } },
+        description: 'Alternativ: Zeitreihe aus macro_series/stock_analysis',
+      },
+      xAxisLabel: { type: 'string' },
+      yAxisLabel: { type: 'string' },
+      trendline: { type: 'boolean', description: 'Bei scatter: Regressionsgerade berechnen (aus zwei Serien x/y)' },
+    },
+    required: ['title'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: [],
+  maxDuration: 5000,
+  maxDataSize: 30000,
+  builtin: true,
+}, async (args) => {
+  const type = ['line', 'bar', 'area', 'pie', 'scatter'].includes(args.type) ? args.type : 'line';
+  const MAX_POINTS = 120;
+
+  let categories: string[] = [];
+  let series: { name: string; data: number[] }[] = [];
+
+  if (Array.isArray(args.timeseries) && args.timeseries.length > 0) {
+    const pts = args.timeseries
+      .filter((p: any) => p && typeof p.date === 'string' && Number.isFinite(Number(p.value)))
+      .map((p: any) => ({ date: p.date, value: Number(p.value) }));
+    if (pts.length === 0) throw new Error('timeseries enthält keine gültigen {date,value}-Paare.');
+    const sampled = downsample(pts, MAX_POINTS);
+    categories = sampled.map(p => p.date);
+    series = [{ name: args.series?.[0]?.name || 'Wert', data: sampled.map(p => p.value) }];
+  } else if (Array.isArray(args.categories) && Array.isArray(args.series)) {
+    categories = args.categories.map((c: any) => String(c));
+    if (categories.length === 0) throw new Error('categories ist leer.');
+    if (categories.length > MAX_POINTS) {
+      categories = categories.slice(0, MAX_POINTS);
+    }
+    series = args.series.map((s: any, i: number) => {
+      if (!Array.isArray(s?.data)) throw new Error(`series[${i}].data fehlt oder ist kein Array.`);
+      const data = s.data.map((v: any) => Number(v));
+      if (data.some((v: number) => !Number.isFinite(v))) throw new Error(`series[${i}] enthält Nicht-Zahlen.`);
+      return { name: String(s.name || `Reihe ${i + 1}`), data: data.slice(0, MAX_POINTS) };
+    });
+    if (series.length === 0) throw new Error('series ist leer.');
+    for (const s of series) {
+      if (s.data.length !== categories.length) {
+        throw new Error(`Längen-Konflikt: categories=${categories.length}, "${s.name}"=${s.data.length}. Beide müssen gleich lang sein.`);
+      }
+    }
+  } else {
+    throw new Error('Entweder "timeseries" ODER "categories"+"series" angeben.');
+  }
+
+  const rows = categories.map((c, i) => {
+    const row: Record<string, any> = { category: c };
+    series.forEach(s => { row[s.name] = s.data[i]; });
+    return row;
+  });
+
+  let trend: { slope: number; intercept: number; r2: number } | null = null;
+  if (type === 'scatter' && args.trendline === true && series.length >= 2) {
+    const reg = linearRegression(series[0].data, series[1].data);
+    if (reg) trend = { slope: round2(reg.slope), intercept: round2(reg.intercept), r2: round2(reg.r2) };
+  }
+
+  return {
+    chartType: 'spec',
+    spec: {
+      type,
+      title: String(args.title).slice(0, 120),
+      xAxisLabel: args.xAxisLabel ? String(args.xAxisLabel).slice(0, 60) : undefined,
+      yAxisLabel: args.yAxisLabel ? String(args.yAxisLabel).slice(0, 60) : undefined,
+      categories,
+      series,
+      rows,
+      ...(trend ? { trend } : {}),
+      pointCount: rows.length,
+    },
+  };
+});
+
+// ---- export_file (file_write) ---------------------------------------------
+toolRegistry.register({
+  id: 'export_file',
+  name: 'Export File',
+  description:
+    'Daten als Datei in den Browser-Download schreiben: CSV (rows als Objekte), JSON oder Markdown-Report. ' +
+    'Output enthält zusätzlich den vollen Text, damit der Nutzer ihn auch ohne Download sehen kann. PDF erst Phase 2/6 (jsPDF).',
+  category: 'report',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      filename: { type: 'string', description: 'Dateiname ohne Endung, z.B. "portfolio-2026-10"' },
+      format: { type: 'string', enum: ['csv', 'json', 'markdown'], description: 'csv|json|markdown (default csv)' },
+      rows: { type: 'array', items: { type: 'object' }, description: 'Bei csv/json: Datenzeilen (flache Objekte)' },
+      columns: { type: 'array', items: { type: 'string' }, description: 'Bei csv: Spaltenreihenfolge (default: keys der ersten Zeile)' },
+      markdown: { type: 'string', description: 'Bei markdown: vollständiger Text (sonst aus rows generiert)' },
+    },
+    required: ['filename'],
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['download'],
+  maxDuration: 8000,
+  maxDataSize: 200000,
+  builtin: true,
+}, async (args) => {
+  const format = ['csv', 'json', 'markdown'].includes(args.format) ? args.format : 'csv';
+  const safeName = String(args.filename || 'export').replace(/[^\w\-]+/g, '_').slice(0, 80) || 'export';
+  let content = '';
+  let mime = 'text/plain';
+
+  if (format === 'csv') {
+    const rows = Array.isArray(args.rows) ? args.rows : [];
+    if (rows.length === 0) throw new Error('Für CSV "rows" (Array von Objekten) angeben.');
+    content = toCsv(rows, Array.isArray(args.columns) ? args.columns : undefined);
+    mime = 'text/csv';
+  } else if (format === 'json') {
+    content = JSON.stringify(args.rows ?? args.markdown ?? {}, null, 2);
+    mime = 'application/json';
+  } else {
+    if (typeof args.markdown === 'string' && args.markdown.trim()) {
+      content = args.markdown;
+    } else if (Array.isArray(args.rows) && args.rows.length) {
+      const cols = Object.keys(args.rows[0]);
+      content = [`| ${cols.join(' | ')} |`, `| ${cols.map(() => '---').join(' |')} |`,
+        ...args.rows.map((r: any) => `| ${cols.map(c => String(r?.[c] ?? '')).join(' | ')} |`)].join('\n');
+    } else {
+      throw new Error('Für markdown "markdown" oder "rows" angeben.');
+    }
+    mime = 'text/markdown';
+  }
+
+  const filename = `${safeName}.${format === 'markdown' ? 'md' : format}`;
+  // Browser-only: trigger download via Blob URL (guarded for test environments).
+  if (typeof document !== 'undefined' && typeof URL !== 'undefined' && URL.createObjectURL) {
+    const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 5000);
+  }
+  return { exported: true, filename, bytes: content.length, preview: content.slice(0, 1500), fullContent: content };
+});
+
+// ---- import_file (file_read) ----------------------------------------------
+toolRegistry.register({
+  id: 'import_file',
+  name: 'Import File',
+  description:
+    'Nutzerdatei einlesen (CSV oder JSON, als base64 aus dem Upload oder direkt als Text). Liefert geparste rows + ' +
+    'Statistik; direkt weiterverarbeitbar mit data_filter/chart_spec. Max ~2 MB.',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      contentBase64: { type: 'string', description: 'Dateiinhalt base64-kodiert (vom UI-Upload gesetzt)' },
+      text: { type: 'string', description: 'Alternativ: roher Textinhalt' },
+      format: { type: 'string', enum: ['csv', 'json', 'auto'], description: 'auto erkennt anhand Inhalt/Endung' },
+      filename: { type: 'string', description: 'Originalname (für Format-Erkennung)' },
+      maxRows: { type: 'number', description: 'Max Zeilen im Output (default 200)' },
+    },
+  },
+  outputSchema: { type: 'object' },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['storage'],
+  maxDuration: 10000,
+  maxDataSize: 2000000,
+  builtin: true,
+}, async (args) => {
+  const MAX_BYTES = 2_000_000;
+  let raw = '';
+  if (typeof args.contentBase64 === 'string' && args.contentBase64) {
+    if (args.contentBase64.length * 0.75 > MAX_BYTES) throw new Error('Datei zu groß (max ~2 MB).');
+    try {
+      raw = atobToUtf8(args.contentBase64);
+    } catch {
+      throw new Error('base64 konnte nicht dekodiert werden.');
+    }
+  } else if (typeof args.text === 'string' && args.text) {
+    if (args.text.length > MAX_BYTES) throw new Error('Text zu groß (max ~2 MB).');
+    raw = args.text;
+  } else {
+    throw new Error('Weder contentBase64 noch text übergeben.');
+  }
+
+  const lowerName = String(args.filename || '').toLowerCase();
+  let format = args.format === 'auto' || !args.format ? undefined : args.format;
+  if (!format) {
+    if (lowerName.endsWith('.json')) format = 'json';
+    else if (lowerName.endsWith('.csv')) format = 'csv';
+    else {
+      const trimmed = raw.trimStart();
+      format = trimmed.startsWith('{') || trimmed.startsWith('[') ? 'json' : 'csv';
+    }
+  }
+
+  const maxRows = Math.min(Math.max(Number(args.maxRows) || 200, 1), 2000);
+  if (format === 'json') {
+    let parsed: any;
+    try { parsed = JSON.parse(raw); } catch (e: any) { throw new Error(`JSON-Fehler: ${e.message}`); }
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    return {
+      format: 'json', rowCount: arr.length,
+      rows: arr.slice(0, maxRows),
+      truncated: arr.length > maxRows,
+      topLevelKeys: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed) : undefined,
+    };
+  }
+
+  const { headers, rows, skippedLines } = parseCsv(raw);
+  const numericCols = headers.filter(h => rows.length > 0 && rows.slice(0, 20).every(r => r[h] === '' || Number.isFinite(Number(r[h]))));
+  return {
+    format: 'csv', columns: headers, rowCount: rows.length,
+    rows: rows.slice(0, maxRows),
+    truncated: rows.length > maxRows,
+    ...(skippedLines > 0 ? { note: `${skippedLines} Zeilen mit abweichender Feldanzahl übersprungen.` } : {}),
+    numericColumns: numericCols,
+  };
+});
+
+/** Decode base64 to a UTF-8 string (browser-safe, no Buffer dependency). */
+function atobToUtf8(b64: string): string {
+  const clean = b64.replace(/^data:[^;]+;base64,/, '').replace(/\s+/g, '');
+  const bin = atob(clean);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
 
