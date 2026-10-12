@@ -2,6 +2,7 @@ import { createContext, useContext, useReducer, useEffect, useMemo, useRef, useC
 import type { AppSettings, ChatSession, WorkflowDefinition, TokenBudget } from '../types';
 import { getSettings, saveSettings, getChatSessions, getWorkflows } from '../services/database';
 import { tpmManager } from '../services/tpm';
+import { schedulerService } from '../services/scheduler';
 
 interface AppState {
   settings: AppSettings | null;
@@ -114,6 +115,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       dispatch({ type: 'SET_WORKFLOWS', payload: workflows });
     }
     load();
+  }, []);
+
+  // Scheduler (docs/fehlende-tools-mehr-macht.md Phase 2): der clientseitige
+  // Tick-Loop wird einmal pro App-Leben gestartet. start() ist idempotent;
+  // stop() nur beim Unmount (StrictMode-doppelter Invoke ist dadurch sicher).
+  useEffect(() => {
+    schedulerService.start();
+    return () => schedulerService.stop();
   }, []);
 
   // Token-Budget: Update NUR bei echten Änderungen (subscribe) plus ein
