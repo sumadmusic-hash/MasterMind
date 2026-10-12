@@ -123,4 +123,38 @@ describe('ToolRegistry', () => {
     expect(result.data.summary).toBeDefined();
     expect(result.data.summary.length).toBeGreaterThan(0);
   });
+  it('should have weather tool registered', () => {
+    const tool = toolRegistry.getTool('weather');
+    expect(tool).toBeDefined();
+    expect(tool?.enabled).toBe(true);
+    expect(tool?.inputSchema.required).toContain('location');
+  });
+
+  describe('search tools regression (empty-result bug)', () => {
+    const exec = (toolId: string, args: any) =>
+      toolRegistry.execute({ id: 't', toolId, toolName: toolId, arguments: args, timestamp: Date.now() });
+
+    it('web_search returns results for a normal query (not only DDG instant answers)', async () => {
+      const result = await exec('web_search', { query: 'Sächsische Schweiz' });
+      expect(result.success).toBe(true);
+      expect(result.data.results.length).toBeGreaterThan(0);
+      expect(result.data.results[0]).toHaveProperty('url');
+    }, 20000);
+
+    it('news_search returns recent articles via RSS providers', async () => {
+      const result = await exec('news_search', { query: 'Deutschland', hoursBack: 168 });
+      expect(result.success).toBe(true);
+      expect(Array.isArray(result.data.articles)).toBe(true);
+      expect(result.data.articles.length).toBeGreaterThan(0);
+      expect(result.data.articles[0].title).toBeTruthy();
+    }, 20000);
+
+    it('weather returns current conditions for a city', async () => {
+      const result = await exec('weather', { location: 'Berlin' });
+      expect(result.success).toBe(true);
+      expect(result.data.found).toBe(true);
+      expect(typeof result.data.current.temperatureC).toBe('number');
+      expect(result.data.forecast.length).toBeGreaterThan(0);
+    }, 20000);
+  });
 });

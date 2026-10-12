@@ -116,6 +116,8 @@ export const toolRegistry = new ToolRegistry();
  */
 export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8): any {
   if (typeof data === 'string') {
+    // Never truncate URLs — citations must stay complete and clickable.
+    if (/^https?:\/\//i.test(data)) return data;
     return data.length > maxStringLen ? data.slice(0, maxStringLen) + '…' : data;
   }
   if (Array.isArray(data)) {
@@ -167,17 +169,21 @@ toolRegistry.register({
   maxDataSize: 50000,
   builtin: true,
 }, async (args) => {
-  // Using a free search approach - in production, this would use a proper search API
-  const query = encodeURIComponent(args.query);
   const maxResults = args.maxResults || 10;
-  
+  const results: Source[] = [];
+  const errors: string[] = [];
+
+  // Provider 1: DuckDuckGo Instant Answer API (free, CORS-enabled).
+  // NOTE: this endpoint only returns *encyclopedic* topics and is empty for
+  // most queries — it must never be the sole source, otherwise every normal
+  // search silently returns "no results".
   try {
-    // Use DuckDuckGo instant answer API as a free fallback
-    const response = await fetch(`https://api.duckduckgo.com/?q=${query}&format=json&no_html=1&skip_disambig=1`);
+    const response = await fetch(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(args.query)}&format=json&no_html=1&skip_disambig=1`,
+      { signal: AbortSignal.timeout(8000) }
+    );
     const data = await response.json();
-    
-    const results: Source[] = [];
-    
+
     if (data.Abstract) {
       results.push({
         title: data.Heading || args.query,
@@ -186,24 +192,65 @@ toolRegistry.register({
         provider: 'duckduckgo',
       });
     }
-    
-    if (data.RelatedTopics) {
-      for (const topic of data.RelatedTopics.slice(0, maxResults)) {
-        if (topic.Text && topic.FirstURL) {
-          results.push({
-            title: topic.Text.split(' - ')[0] || topic.Text.substring(0, 80),
-            url: topic.FirstURL,
-            snippet: topic.Text,
-            provider: 'duckduckgo',
-          });
-        }
-      }
-    }
 
-    return { results: results.slice(0, maxResults), query: args.query };
+    for (const topic of flattenDDGTopics(data)) {
+      if (results.length >= maxResults) break;
+      results.push(topic);
+    }
   } catch (err: any) {
-    return { results: [], query: args.query, error: err.message };
+    errors.push(`duckduckgo: ${err.message}`);
   }
+
+  // Provider 2: Wikipedia search API (CORS-enabled via origin=*, works for
+  // virtually any topical query, including German places/terms).
+  try {
+    const lang = /^[a-z]{2}(-[a-z]{2})?$/i.test((args.language || '').trim())
+      ? args.language.trim().toLowerCase().split('-')[0]
+      : 'de';
+    const limit = Math.min(Math.max(maxResults, 1), 8);
+    // Wikipedia requires a descriptive User-Agent (generic/default agents get
+    // HTTP 403). Browsers ignore the UA header, so this is browser-safe.
+    const wResp = await fetch(
+      `https://${lang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(args.query)}` +
+      `&srlimit=${limit}&srprop=snippet|timestamp&format=json&origin=*`,
+      {
+        headers: { 'User-Agent': 'AI-Research-Assistant/1.0 (research tool; contact: local)' },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!wResp.ok) throw new Error(`HTTP ${wResp.status}`);
+    const hits: any[] = (await wResp.json())?.query?.search || [];
+
+    for (const p of hits) {
+      if (results.length >= maxResults) break;
+      const snippet = stripHtml(String(p.snippet || ''));
+      results.push({
+        title: p.title,
+        url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(p.title.replace(/ /g, '_'))}`,
+        snippet: snippet || `Wikipedia-Artikel: ${p.title}`,
+        publishedAt: p.timestamp,
+        provider: `wikipedia-${lang}`,
+      });
+    }
+  } catch (err: any) {
+    errors.push(`wikipedia: ${err.message}`);
+  }
+
+  if (results.length === 0) {
+    return {
+      results: [],
+      query: args.query,
+      error: errors.join('; ') || 'No results from any provider',
+      note: 'Alle Such-Provider haben keine Ergebnisse geliefert. Bitte Formulierung anpassen oder news_search/url_fetch verwenden.',
+    };
+  }
+
+  return {
+    results: results.slice(0, maxResults),
+    query: args.query,
+    providers: [...new Set(results.map(r => r.provider))],
+    ...(errors.length ? { partialErrors: errors } : {}),
+  };
 });
 
 // News Search Tool
@@ -227,38 +274,281 @@ toolRegistry.register({
       articles: { type: 'array' }
     }
   },
-  version: '1.0.0',
+  version: '1.1.0',
   enabled: true,
   permissions: ['network'],
   maxDuration: 15000,
   maxDataSize: 50000,
   builtin: true,
 }, async (args) => {
-  // Using DuckDuckGo news as a free news source
-  const query = encodeURIComponent(args.query + ' news');
-  
+  const maxResults = args.maxResults || 10;
+  const hoursBack = args.hoursBack || 48;
+  const errors: string[] = [];
+
+  // RSS feeds are the only free news endpoints that work from the browser
+  // without an API key. They are tried in order until enough fresh items exist.
+  const q = encodeURIComponent(args.query);
+  const feeds = [
+    `https://news.google.com/rss/search?q=${q}&hl=de&gl=DE&ceid=DE:de`,
+    `https://www.bing.com/news/search?q=${q}&format=rss`,
+  ];
+
+  let articles: any[] = [];
+  for (const url of feeds) {
+    try {
+      const resp = await fetch(url, {
+        headers: { Accept: 'application/rss+xml, application/xml, text/xml' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) { errors.push(`${new URL(url).host}: HTTP ${resp.status}`); continue; }
+      const parsed = parseRss(await resp.text(), new URL(url).host);
+      if (parsed.length === 0) { errors.push(`${new URL(url).host}: no items`); continue; }
+      articles = mergeArticles(articles, parsed);
+      if (articles.length >= maxResults) break;
+    } catch (err: any) {
+      errors.push(`${new URL(url).host}: ${err.message}`);
+    }
+  }
+
+  // Recency filter (best effort: keep everything if no dates could be parsed)
+  const cutoff = Date.now() - hoursBack * 3600 * 1000;
+  const dated = articles.filter(a => a.publishedAt && !Number.isNaN(Date.parse(a.publishedAt)));
+  if (dated.length > 0) {
+    const fresh = dated.filter(a => Date.parse(a.publishedAt) >= cutoff);
+    articles = (fresh.length > 0 ? fresh : dated).sort(
+      (a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)
+    );
+  } else {
+    articles = articles.slice(0, maxResults);
+  }
+
+  return {
+    articles: dedupeByUrl(articles).slice(0, maxResults),
+    query: args.query,
+    hoursBack,
+    ...(articles.length === 0 && errors.length ? { error: errors.join('; ') } : {}),
+  };
+});
+
+// Weather Tool
+toolRegistry.register({
+  id: 'weather',
+  name: 'Weather',
+  description: 'Get current weather and a short forecast for a city. Answers weather questions directly — do not use web_search for this.',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      location: { type: 'string', description: 'City or place name (e.g., "Görlitz", "Berlin")' },
+      days: { type: 'number', description: 'Forecast days to include (default 3, max 7)' },
+    },
+    required: ['location'],
+  },
+  outputSchema: {
+    type: 'object',
+    properties: {
+      location: { type: 'string' },
+      current: { type: 'object' },
+      forecast: { type: 'array' },
+    }
+  },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network'],
+  maxDuration: 12000,
+  maxDataSize: 20000,
+  builtin: true,
+}, async (args) => {
+  const location = String(args.location || '').trim();
+  if (!location) return { error: 'No location provided', found: false };
+  const days = Math.min(Math.max(args.days || 3, 1), 7);
+
   try {
-    const response = await fetch(`https://api.duckduckgo.com/?q=${query}&format=json&no_html=1`);
-    const data = await response.json();
-    
-    const articles = [];
-    if (data.News) {
-      for (const item of data.News.slice(0, args.maxResults || 10)) {
-        articles.push({
-          title: item.title,
-          url: item.url,
-          snippet: item.excerpt || '',
-          source: item.date ? new Date(item.date * 1000).toISOString() : new Date().toISOString(),
-          publishedAt: item.date ? new Date(item.date * 1000).toISOString() : undefined,
-        });
-      }
+    // Step 1: resolve the place name to coordinates (free, CORS-enabled).
+    const geoResp = await fetch(
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=de&format=json`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    const geo = await geoResp.json();
+    const place = geo?.results?.[0];
+
+    // Step 2: current conditions + daily forecast from Open-Meteo (no key needed).
+    if (place) {
+      const wxResp = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}` +
+        `&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m` +
+        `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max&timezone=auto&forecast_days=${days}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      const wx = await wxResp.json();
+      const cur = wx.current || {};
+      const daily = wx.daily || {};
+
+      const forecast = (daily.time || []).map((date: string, idx: number) => ({
+        date,
+        condition: weatherCodeText(daily.weather_code?.[idx]),
+        tempMaxC: daily.temperature_2m_max?.[idx],
+        tempMinC: daily.temperature_2m_min?.[idx],
+        precipitationMm: daily.precipitation_sum?.[idx],
+        windMaxKmh: daily.wind_speed_10m_max?.[idx],
+      }));
+
+      return {
+        found: true,
+        location: `${place.name}${place.admin1 ? ', ' + place.admin1 : ''} (${place.country || geo?.results?.[0]?.country || ''})`,
+        coordinates: { lat: place.latitude, lon: place.longitude },
+        current: {
+          temperatureC: cur.temperature_2m,
+          feelsLikeC: cur.apparent_temperature,
+          condition: weatherCodeText(cur.weather_code),
+          humidityPercent: cur.relative_humidity_2m,
+          precipitationMm: cur.precipitation,
+          windKmh: cur.wind_speed_10m,
+          windDirectionDeg: cur.wind_direction_10m,
+          measuredAt: cur.time,
+          timezone: wx.timezone,
+        },
+        forecast,
+      };
     }
 
-    return { articles, query: args.query, hoursBack: args.hoursBack || 48 };
+    // Fallback: wttr.in JSON (also free/CORS) when geocoding finds nothing.
+    const altResp = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=j1`, {
+      signal: AbortSignal.timeout(9000),
+    });
+    if (!altResp.ok) return { location, found: false, error: `Weather source returned HTTP ${altResp.status}` };
+    const alt = await altResp.json();
+    const c = alt.current_condition?.[0] || {};
+    return {
+      found: true,
+      provider: 'wttr.in',
+      location: `${c?.nearest_area?.[0]?.areaName?.[0]?.value || location}, ${c?.nearest_area?.[0]?.country?.[0]?.value || ''}`,
+      current: {
+        temperatureC: Number(c.temp_C),
+        feelsLikeC: Number(c.FeelsLikeC),
+        condition: c.weatherDesc?.[0]?.value,
+        humidityPercent: Number(c.humidity),
+        windKmh: Number(c.windspeedKmph),
+      },
+      forecast: (alt.weather || []).slice(0, days).map((w: any) => ({
+        date: w.date,
+        tempMaxC: Number(w.maxtempC),
+        tempMinC: Number(w.mintempC),
+        precipitationMm: (w.hourly || []).reduce((sum: number, h: any) => sum + Number(h.precipMM || 0), 0),
+      })),
+    };
   } catch (err: any) {
-    return { articles: [], query: args.query, error: err.message };
+    return { location, found: false, error: err.message };
   }
 });
+
+/** Map WMO weather codes (Open-Meteo) to German descriptions. */
+function weatherCodeText(code: number | undefined): string {
+  const map: Record<number, string> = {
+    0: 'Klar', 1: 'Überwiegend klar', 2: 'Teilweise bewölkt', 3: 'Bedeckt',
+    45: 'Nebel', 48: 'Reifnebel', 51: 'Leichter Nieselregen', 53: 'Nieselregen', 55: 'Starker Nieselregen',
+    56: 'Gefrierender Nieselregen', 57: 'Starker gefrierender Nieselregen',
+    61: 'Leichter Regen', 63: 'Regen', 65: 'Starker Regen',
+    66: 'Gefrierender Regen', 67: 'Starker gefrierender Regen',
+    71: 'Leichter Schneefall', 73: 'Schneefall', 75: 'Starker Schneefall', 77: 'Schneegriesel',
+    80: 'Leichte Schauer', 81: 'Schauer', 82: 'Heftige Schauer',
+    85: 'Schneeschauer', 86: 'Starke Schneeschauer',
+    95: 'Gewitter', 96: 'Gewitter mit Hagel', 99: 'Schweres Gewitter mit Hagel',
+  };
+  return code !== undefined && map[code] !== undefined ? map[code] : 'Unbekannt';
+}
+
+/** Minimal RSS 2.0 parser (Google News / Bing News feeds). */
+function parseRss(xml: string, providerHint: string): any[] {
+  const items = xml.match(/<item[\s\S]*?<\/item>/g) || [];
+  const pick = (block: string, tag: string): string => {
+    const m = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`));
+    if (!m) return '';
+    let v = m[1].trim();
+    v = v.replace(/^<!\[CDATA\[/, '').replace(/\]\]>$/, '');
+    return decodeXmlEntities(v);
+  };
+
+  return items.map(item => {
+    const rawLink = pick(item, 'link');
+    const title = pick(item, 'title');
+    const description = pick(item, 'description').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const pubDate = pick(item, 'pubDate');
+    const sourceMatch = item.match(/<source[^>]*>([\s\S]*?)<\/source>/);
+    const publishedAt = pubDate ? new Date(pubDate).toISOString() : undefined;
+
+    return {
+      title,
+      url: cleanUrl(rawLink),
+      snippet: description.slice(0, 300),
+      source: sourceMatch ? decodeXmlEntities(sourceMatch[1].replace(/<[^>]+>/g, '').trim()) : providerHint,
+      publishedAt,
+      provider: providerHint,
+    };
+  }).filter(a => a.title && a.url);
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
+function cleanUrl(url: string): string {
+  // Strip Bing news redirect wrapper (…&url=https%3a%2f%2factual.link&…)
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.endsWith('bing.com')) {
+      const inner = parsed.searchParams.get('url');
+      if (inner) return inner;
+    }
+  } catch { /* keep original */ }
+  return url;
+}
+
+function mergeArticles(existing: any[], incoming: any[]): any[] {
+  const out = [...existing];
+  for (const a of incoming) {
+    if (!out.some(o => o.url === a.url || o.title === a.title)) out.push(a);
+  }
+  return out;
+}
+
+function dedupeByUrl(articles: any[]): any[] {
+  const seen = new Set<string>();
+  return articles.filter(a => {
+    const key = a.url || a.title;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function stripHtml(value: string): string {
+  return value.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** Flatten DDG RelatedTopics (which can contain nested topic groups) into Source items. */
+function flattenDDGTopics(data: any): Source[] {
+  const out: Source[] = [];
+  const push = (t: any) => {
+    if (t?.Text && t?.FirstURL) {
+      out.push({
+        title: t.Text.split(' - ')[0] || t.Text.substring(0, 80),
+        url: t.FirstURL,
+        snippet: t.Text,
+        provider: 'duckduckgo',
+      });
+    }
+  };
+  for (const topic of data?.RelatedTopics || []) {
+    if (topic?.Topics) topic.Topics.forEach(push); else push(topic);
+  }
+  for (const r of data?.Results || []) push(r);
+  return out;
+}
 
 // Company Lookup Tool
 toolRegistry.register({
