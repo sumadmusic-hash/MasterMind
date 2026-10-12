@@ -30,10 +30,17 @@ export default defineConfig({
   },
   server: {
     host: "0.0.0.0",
-    port: 3000,
+    // Standard Vite-Port (5173): Der Preview-/Proxy-Layer der Plattform stellt
+    // die App unter http://localhost:5173 bereit. Ein hart erzwungener
+    // anderer Port (früher 3000 mit strictPort) führte dazu, dass Requests
+    // auf 5173 von einem statischen Fallback bedient wurden, der JS-Module
+    // mit MIME-Type "text/html" auslieferte -> weißer Bildschirm.
+    port: 5173,
     strictPort: true,
+    // HMR-WebSocket an denselben Port wie den Dev-Server binden, damit er
+    // auch hinter Proxys funktioniert und nicht stumm auf Port 3000 zeigt.
     hmr: {
-      port: 3000,
+      port: 5173,
     },
   },
 });
