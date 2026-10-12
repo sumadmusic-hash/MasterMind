@@ -344,8 +344,10 @@ async function executeProviderCall(
   }
 
   if (callbacks?.onToken) {
-    // Streaming response
-    return handleStreamingResponse(response, callbacks);
+    // Streaming response. Pass the request messages so prompt tokens can be
+    // estimated from the actual PROMPT when the provider doesn't report usage
+    // in the stream (previously they were wrongly derived from the reply text).
+    return handleStreamingResponse(response, callbacks, messages);
   } else {
     // Non-streaming response
     const data = await response.json();
@@ -365,7 +367,8 @@ async function executeProviderCall(
 
 async function handleStreamingResponse(
   response: Response,
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  requestMessages?: ProviderMessage[]
 ): Promise<{ content: string; usage: TokenUsage }> {
   const reader = response.body?.getReader();
   if (!reader) throw new Error('No response body');
@@ -457,7 +460,10 @@ async function handleStreamingResponse(
 
   const estimated = !promptTokens;
   if (estimated) {
-    promptTokens = Math.ceil(fullContent.length / 4);
+    // The provider didn't report usage: estimate prompt tokens from the ACTUAL
+    // request messages. Deriving them from the reply text (fullContent.length/4)
+    // as before systematically distorted TPM budgeting and the usage dashboard.
+    promptTokens = requestMessages ? estimateTokens(requestMessages) : 0;
     completionTokens = Math.ceil(fullContent.length / 4);
   }
 

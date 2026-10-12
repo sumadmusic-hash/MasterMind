@@ -86,10 +86,11 @@ class TokenPerMinuteManager {
     const immediate = await this.reserve(provider, tokens, settings);
     if (immediate) return immediate;
 
-    // The blocked attempt above may have left a timed-out reservation behind
-    // that still occupies budget — drop it so our own wait doesn't compete
-    // with a stale entry of the very same request.
-    this.releaseReservation(provider);
+    // NOTE: Do NOT release any reservation here. A failed `reserve()` never
+    // creates a reservation of its own, so there is nothing of ours to clean
+    // up. Releasing the oldest reservation of this provider would steal the
+    // pending budget of a *different*, in-flight request and corrupt the
+    // reserved-tokens counter (allowing more traffic than the limit permits).
 
     // Distinguish "temporarily full" from "never fits": if even an empty
     // window couldn't accommodate this request, waiting is pointless.

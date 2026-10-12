@@ -100,6 +100,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
         };
         dispatch({ type: 'SET_SETTINGS', payload: defaults });
         await saveSettings(defaults);
+        // Configure the TPM manager with the defaults too — previously it was
+        // never configured on first run, so the budget limits only reflected
+        // whatever internal defaults tpmManager happened to hold.
+        tpmManager.configure(defaults);
       }
       dispatch({ type: 'SET_SETTINGS_LOADED' });
 
