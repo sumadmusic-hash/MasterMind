@@ -60,15 +60,16 @@ export function SettingsPage() {
       const base = String(settings.webzApiBaseUrl || '').trim().replace(/\/+$/, '') || '/webz-api';
       // credentials:'omit' → kein Browser-Login-Dialog bei HTTP 401 (Webz antwortet
       // mit WWW-Authenticate: Basic, obwohl nur ein API-Token nötig ist).
-      const resp = await fetch(`${base}/search?${new URLSearchParams({ token, format: 'json', size: '1' })}`, {
+      const resp = await fetch(`${base}/api/news?${new URLSearchParams({ token, format: 'json', q: '*', sort: 'crawled', size: '1' })}`, {
         signal: AbortSignal.timeout(12000),
         credentials: 'omit',
       });
-      if (resp.status === 401) throw new Error('Ungültiges Token (HTTP 401) — kein Benutzername/Passwort nötig, nur das API-Token aus dem Webz-Dashboard');
+      if (resp.status === 401) throw new Error('Ungültiges Token (HTTP 401 "Unknown API token") — kein Benutzername/Passwort nötig, nur das API-Token aus dem Webz-Dashboard');
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json().catch(() => null);
       if (!data || typeof data !== 'object') throw new Error('Keine JSON-Antwort (Proxy fehlt?)');
-      if (Array.isArray(data.hits)) {
+      // /api/news liefert { posts: [...], total_results, ... }
+      if (Array.isArray(data.posts)) {
         setWebzTestResult({ success: true });
       } else {
         setWebzTestResult({ success: false, error: String(data?.error || data?.message || 'Unerwartetes Antwortformat') });

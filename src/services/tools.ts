@@ -463,18 +463,25 @@ toolRegistry.register({
 
 // ============ Webz.io News API (https://app.webz.io/) ============
 //
-// Nutzung der API (Stand: Recherche Okt. 2026):
-// - Endpunkt:    GET https://api.webz.io/search?token=<TOKEN>&format=json&query=...
-//   (live verifiziert: unbekannte Token → HTTP 401 "Unknown API token <x>",
-//    alle anderen Pfade auf api.webz.io liefern 404 — "search" ist der News-Endpunkt)
+// Nutzung der API (Stand: Okt. 2026, am offiziellen "Integrate"-Beispiel
+// aus dem Webz-Dashboard live verifiziert):
+// - Endpunkt:    GET https://api.webz.io/api/news?token=<TOKEN>&format=json&q=...
+//   (Achtung: der Pfad lautet "/api/news" — "/search" und "/api/search" liefern 404)
 // - Auth:        Token als Query-Parameter, kein OAuth/Header. Das Token gibt es
 //                nach Registrierung im Dashboard: https://app.webz.io/ (API-Token-Seite).
-// - Parameter:   query (Pflicht), size (1..100, Standard 10), dateFilter ("Today"/
-//                "Last2Days"/"Last7Days"/"Last30Days"), dateFrom/dateTo (YYYY-MM-DD),
-//                language (ISO 639-1, z. B. "de"), category, sourceLocation, includeHtml,
-//                userFields, format=json|rss|xml, orderBy=date|relevance, pageType, cursor.
-// - Antwort:     { took, hits: [{ title, url, description, snippet, image, date,
-//                thirdPartyId, siteParameters: { name, domain, lang, isFakeNews } }] }
+//                Ungültiges Token → HTTP 401 {"detail":"Unknown API token"} (JSON).
+// - Parameter:   q (Suchanfrage; "*" = alles — dann besser sort=crawled),
+//                size (1..100, Standard 10), page (Seitennummerierung),
+//                sort=crawled|date|relevance, ts (Zeitstempel für Historie),
+//                dateFilter ("Today"/"Last2Days"/"Last7Days"/"Last30Days") bzw.
+//                dateFrom/dateTo (YYYY-MM-DD), language (ISO 639-1, z. B. "de"),
+//                category (z. B. business/tech/politics), author, title,
+//                relatedToUuid, bookmarkName, includeSyndicated (bool),
+//                allowNewsHistory (bool), webz_reporter (bool), format=json|rss|xml.
+// - Antwort:     { posts: [{ thread: { url, site, site_title, site_categories,
+//                title, published (ISO-Datum), site_type, country, main_image },
+//                url, title, text (Artikeltext), author, published, ... }],
+//                next, total_results, more_results_available, balance, cost, warnings }
 // - CORS:        api.webz.io sendet KEINE Access-Control-Allow-Origin-Headers; ein
 //                direkter Browser-Fetch wird daher vom Browser blockiert. Lösung:
 //                Requests laufen über den Vite-Dev-Proxy (/webz-api → api.webz.io)
@@ -498,18 +505,28 @@ function webzDateFilter(hoursBack: number): string {
   return 'Last30Days';
 }
 
-/** Mappt einen Webz-Treffer auf das gemeinsame Source-Schema der App. */
-function mapWebzHit(hit: any): Source & { content?: string } {
-  const site = hit?.siteParameters || {};
+/**
+ * Mappt einen Webz-/api/news-Post (`posts[i]` mit eingebettetem `thread`)
+ * auf das gemeinsame Source-Schema der App.
+ */
+function mapWebzHit(post: any): Source & { content?: string } {
+  const thread = post?.thread || {};
+  const text = String(post?.text || '');
+  // published ist ein ISO-Datum (z. B. "2026-10-09T16:40:00.000+03:00")
+  const publishedRaw = post?.published || thread?.published;
+  const publishedDate = publishedRaw ? new Date(String(publishedRaw)) : null;
   return {
-    title: String(hit.title || '(ohne Titel)'),
-    url: String(hit.url || ''),
-    snippet: String(hit.description || hit.snippet || ''),
-    publishedAt: hit.date ? new Date(Number(hit.date)).toISOString() : undefined,
-    provider: `webz:${site.domain || 'unknown'}`,
-    sourceName: site.name || undefined,
-    isFakeNewsFlag: site.isFakeNews === true,
-    content: hit.content ? String(hit.content).slice(0, 500) : undefined,
+    title: String(post?.title || thread?.title || '(ohne Titel)'),
+    url: String(post?.url || thread?.url || ''),
+    snippet: text ? text.slice(0, 300) : String(thread?.section_title || ''),
+    publishedAt: publishedDate && !Number.isNaN(publishedDate.getTime())
+      ? publishedDate.toISOString()
+      : undefined,
+    provider: `webz:${thread.site || thread.site_full || 'unknown'}`,
+    sourceName: thread.site_title || thread.site || undefined,
+    image: thread.main_image || undefined,
+    categories: Array.isArray(thread.site_categories) ? thread.site_categories.slice(0, 5) : undefined,
+    content: text ? text.slice(0, 500) : undefined,
   } as any;
 }
 
@@ -523,6 +540,7 @@ async function fetchWebzJson(params: Record<string, string | number | boolean>):
     );
   }
   const base = await getWebzBaseUrl();
+  // Offizielles Dashboard-Schema: GET {base}/api/news?token=...&format=json&q=...
   const qs = new URLSearchParams({ token, format: 'json', ...toQueryParams(params) });
   // `credentials: 'omit'` unterdrückt den HTTP-Basic-Auth-Dialog des Browsers:
   // api.webz.io antwortet bei einem ungültigen Token mit HTTP 401 + Header
@@ -531,13 +549,17 @@ async function fetchWebzJson(params: Record<string, string | number | boolean>):
   // Login-Maske — obwohl Webz.io gar keine Basic-Auth kennt, sondern nur das
   // API-Token als Query-Parameter braucht. Mit 'omit' erhalten wir stattdessen
   // die klare Fehlermeldung unten.
-  const resp = await fetch(`${base}/search?${qs}`, { signal: AbortSignal.timeout(10000), credentials: 'omit' });
+  const resp = await fetch(`${base}/api/news?${qs}`, { signal: AbortSignal.timeout(10000), credentials: 'omit' });
 
   if (resp.status === 401) {
-    throw new Error('Webz.io: ungültiges API-Token (HTTP 401). Token in den Einstellungen prüfen (Dashboard: https://app.webz.io/ → API-Token). Es ist kein Benutzername/Passwort nötig.');
+    // /api/news antwortet bei ungültigem Token mit JSON {"detail":"Unknown API token"}
+    throw new Error('Webz.io: ungültiges API-Token (HTTP 401 "Unknown API token"). Token in den Einstellungen prüfen (Dashboard: https://app.webz.io/ → API-Token). Es ist kein Benutzername/Passwort nötig.');
   }
   if (resp.status === 429) {
     throw new Error('Webz.io: Rate-Limit erreicht (HTTP 429). Weniger/vorsichtigere Anfragen oder Plan-Quota prüfen.');
+  }
+  if (resp.status === 404) {
+    throw new Error('Webz.io: Endpunkt nicht gefunden (HTTP 404). Erwarteter Pfad: {Proxy}/api/news — Proxy-Konfiguration (webzApiBaseUrl / Vite-Dev-Proxy) prüfen.');
   }
   if (!resp.ok) {
     throw new Error(`Webz.io: HTTP ${resp.status}`);
@@ -573,7 +595,7 @@ toolRegistry.register({
   id: 'webz_news',
   name: 'Webz.io News Search',
   description:
-    'News-Recherche über die Webz.io-API (api.webz.io/search): globale Nachrichtenseiten inkl. ' +
+    'News-Recherche über die Webz.io-API (api.webz.io/api/news): globale Nachrichtenseiten inkl. ' +
     'deutscher Quellen, mit Kategorie-, Sprach- und Datumsfiltern. Liefert Titel, Quelle, '
     + 'URL, Beschreibung/Volltextauszug und Datum. Bevorzugt bei aktuellen Nachrichten, ' +
     'Marktentwicklungen und Themenbeobachtung. Benötigt das Webz.io-API-Token aus den Einstellungen.',
@@ -614,21 +636,29 @@ toolRegistry.register({
   const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 168, 1), 24 * 30);
 
   const data = await fetchWebzJson({
-    query: String(args.query).trim(),
+    q: String(args.query).trim(),
     size,
+    sort: 'date',
     dateFilter: webzDateFilter(hoursBack),
     language: args.language,
     category: args.category,
-    userFields: args.includeContent ? 'content,title,url,date,description' : '',
+    includeSyndicated: false,
+    // Ohne diesen Flag liefert /api/news nur die letzten ~30 Tage; mit ihm ist
+    // auch Historiensuche möglich (wie im offiziellen Dashboard-Snippet).
+    allowNewsHistory: true,
   });
 
-  const hits: any[] = Array.isArray(data?.hits) ? data.hits : [];
-  const articles = dedupeByUrl(hits.map(mapWebzHit)).slice(0, size);
+  const posts: any[] = Array.isArray(data?.posts) ? data.posts : [];
+  let articles = dedupeByUrl(posts.map(mapWebzHit)).slice(0, size);
+  // includeContent=false spart Prompt-Tokens: Volltextauszüge wieder rausnehmen.
+  if (args.includeContent === false) {
+    articles = articles.map(({ content, ...rest }: any) => rest);
+  }
 
   return {
     query: args.query,
     provider: 'webz.io',
-    totalHits: typeof data?.total === 'number' ? data.total : hits.length,
+    totalHits: typeof data?.total_results === 'number' ? data.total_results : posts.length,
     tookMs: data?.took,
     hoursBack,
     articles,
@@ -676,23 +706,26 @@ toolRegistry.register({
   const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 24, 1), 24 * 30);
 
   const data = await fetchWebzJson({
-    query: '',
+    // q="*" = gesamtes Korpus (offizielles Dashboard-Muster für "Top News"),
+    // sort=crawled liefert die gerade frisch eingetroffenen Meldungen.
+    q: '*',
     size,
+    sort: 'crawled',
     dateFilter: webzDateFilter(hoursBack),
     category: args.category || 'business',
     language: args.language,
-    orderBy: 'date',
+    includeSyndicated: false,
   });
 
-  const hits: any[] = Array.isArray(data?.hits) ? data.hits : [];
-  const articles = dedupeByUrl(hits.map(mapWebzHit)).slice(0, size);
+  const posts: any[] = Array.isArray(data?.posts) ? data.posts : [];
+  const articles = dedupeByUrl(posts.map(mapWebzHit)).slice(0, size);
 
   return {
     provider: 'webz.io',
     category: args.category || 'business',
     language: args.language || 'any',
     hoursBack,
-    totalHits: typeof data?.total === 'number' ? data.total : hits.length,
+    totalHits: typeof data?.total_results === 'number' ? data.total_results : posts.length,
     articles,
     ...(articles.length === 0 ? { note: 'Keine Treffer in diesem Fenster — hoursBack erhoehen oder language/category lockern.' } : {}),
   };
