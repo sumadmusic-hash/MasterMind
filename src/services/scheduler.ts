@@ -3,6 +3,7 @@ import {
   getScheduledJobs, saveScheduledJob, addScheduledRun, getWorkflow, addLog,
 } from './database';
 import { workflowEngine } from './workflow';
+import { setExecutionOrigin } from './tools';
 
 /**
  * Clientseitiger Scheduler (docs/fehlende-tools-mehr-macht.md, Phase 2).
@@ -81,13 +82,22 @@ class SchedulerService {
     const startedAt = Date.now();
     try {
       const outcome = await this.markManual(async () => {
-        if (!job.workflowId) {
-          throw new Error('Job hat kein Workflow hinterlegt (workflowId fehlt) — im Bereich Workflows erstellen/zweisen.');
+        // Origin marker for the write-guard in tools.ts (assertInteractive):
+        // scheduled runs must not silently rewrite memory/positions/jobs.
+        // Manual UI runs („Jetzt testen") stay 'user'. try/finally restores
+        // 'user' even on throw, so a failed run can't poison later turns.
+        setExecutionOrigin(opts.manual ? 'user' : 'scheduled');
+        try {
+          if (!job.workflowId) {
+            throw new Error('Job hat kein Workflow hinterlegt (workflowId fehlt) — im Bereich Workflows erstellen/zweisen.');
+          }
+          const wf = await getWorkflow(job.workflowId);
+          if (!wf) throw new Error(`Workflow nicht gefunden: ${job.workflowId}`);
+          if (wf.status === 'disabled') throw new Error(`Workflow ist deaktiviert: ${wf.name}`);
+          return workflowEngine.executeWorkflow(wf, job.inputs || {});
+        } finally {
+          setExecutionOrigin('user');
         }
-        const wf = await getWorkflow(job.workflowId);
-        if (!wf) throw new Error(`Workflow nicht gefunden: ${job.workflowId}`);
-        if (wf.status === 'disabled') throw new Error(`Workflow ist deaktiviert: ${wf.name}`);
-        return workflowEngine.executeWorkflow(wf, job.inputs || {});
       });
       const finishedAt = Date.now();
       const success = !!outcome.success;

@@ -3,6 +3,7 @@ import { callProvider, type ProviderMessage } from './provider';
 import { toolRegistry, compactToolData } from './tools';
 import { saveChatSession } from './database';
 import { addLog } from './database';
+import { buildMemoryPrompt } from './database';
 
 /**
  * Limits for tool results sent back to the model. Every retained result is
@@ -310,7 +311,18 @@ export class ChatOrchestrator {
     session: ChatSession,
     callbacks: ChatOrchestratorCallbacks
   ): Promise<{ interruption?: { err: any; ctx: Parameters<ChatOrchestrator['persistInterruptedTurn']>[2] } } | void> {
-    const messages = this.buildProviderMessages(session.messages);
+    // user_memory (docs/fehlende-tools-mehr-macht.md Phase 1): the persisted
+    // memory block is appended to the system prompt once per turn — every
+    // step of the agent loop reuses this message array, so memories ride
+    // along on all provider calls without extra DB hits. buildMemoryPrompt
+    // caps the block size itself (token budget), failures must never break
+    // a chat turn, hence the try/catch.
+    let systemContent = SYSTEM_PROMPT;
+    try {
+      const memBlock = await buildMemoryPrompt();
+      if (memBlock) systemContent = `${SYSTEM_PROMPT}\n\n${memBlock}`;
+    } catch { /* memory is best-effort */ }
+    const messages = this.buildProviderMessages(session.messages, systemContent);
     const tools = toolRegistry.getToolDefinitionsForLLM();
     // Accumulates the FINAL answer text across steps. Previously it was reset
     // to '' at the end of every step, so when the max-steps limit was hit the
@@ -843,9 +855,9 @@ export class ChatOrchestrator {
     }
   }
 
-  private buildProviderMessages(chatMessages: ChatMessage[]): ProviderMessage[] {
+  private buildProviderMessages(chatMessages: ChatMessage[], systemContent: string = SYSTEM_PROMPT): ProviderMessage[] {
     const messages: ProviderMessage[] = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemContent },
     ];
 
     // History tool calls/results are NOT replayed into follow-up prompts: the
