@@ -300,6 +300,14 @@ export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8):
   if (data && typeof data === 'object') {
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(data)) {
+      // Sonderbehandlung "chart": der validierte Chart-Spec von chart_spec
+      // wird von ChatPage direkt gerendert (lazy recharts). series/categories
+      // sind bereits hart auf 120 Punkte begrenzt; die generische Kürzung
+      // (maxArrayLen 8) würde das Diagramm zerstören — deshalb unangetastet.
+      if (k === 'chart' && v && typeof v === 'object') {
+        out[k] = v;
+        continue;
+      }
       // Sonderbehandlung "content": dieses Feld enthält die bewusst gesetzten
       // Textauszüge der Tools (Webz-Volltext ~800 Z., url_fetch-Artikeltext).
       // Die globale Stringkürzung würde sie auf Snippet-Größe stutzen und damit
@@ -3129,8 +3137,21 @@ toolRegistry.register({
     if (reg) trend = { slope: round2(reg.slope), intercept: round2(reg.intercept), r2: round2(reg.r2) };
   }
 
+  // `chart` is the compact form ChatPage renders directly (lazy recharts
+  // chunk); it must survive compactToolData untouched, hence the explicit
+  // exemption there. `rows` stays for the model/UI table fallback.
   return {
     chartType: 'spec',
+    chart: {
+      type,
+      title: String(args.title).slice(0, 120),
+      xAxisLabel: args.xAxisLabel ? String(args.xAxisLabel).slice(0, 60) : undefined,
+      yAxisLabel: args.yAxisLabel ? String(args.yAxisLabel).slice(0, 60) : undefined,
+      categories,
+      series,
+      ...(trend ? { trend } : {}),
+      pointCount: rows.length,
+    },
     spec: {
       type,
       title: String(args.title).slice(0, 120),
