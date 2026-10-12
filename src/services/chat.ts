@@ -1,7 +1,7 @@
 import type { ChatMessage, ChatSession, AppSettings, ToolCall, ToolResult, Source } from '../types';
 import { callProvider, type ProviderMessage } from './provider';
 import { toolRegistry, compactToolData } from './tools';
-import { saveChatSession, getChatSession } from './database';
+import { saveChatSession } from './database';
 import { addLog } from './database';
 
 // Compact system prompt: the tool list was removed because full tool names,
@@ -173,11 +173,29 @@ export class ChatOrchestrator {
   ): Promise<void> {
     const messages = this.buildProviderMessages(session.messages);
     const tools = toolRegistry.getToolDefinitionsForLLM();
+    // Accumulates the FINAL answer text across steps. Previously it was reset
+    // to '' at the end of every step, so when the max-steps limit was hit the
+    // fallback message below always contained nothing but the boilerplate —
+    // everything the model had streamed during the turn was lost.
     let fullContent = '';
+    let lastStepContent = '';
     let currentModel = '';
     let currentProvider = '';
     let totalTokens = 0;
+    // Sources are collected across ALL steps of the turn and deduplicated by
+    // URL — models often run the same search in several steps, which
+    // previously produced duplicated citation lists in the final message.
     const sources: Source[] = [];
+    const seenSourceUrls = new Set<string>();
+    const addSource = (s: Source) => {
+      if (seenSourceUrls.has(s.url)) return;
+      seenSourceUrls.add(s.url);
+      sources.push(s);
+    };
+    // Tool activity of the whole turn, persisted on the final assistant
+    // message so follow-up turns can see WHAT was researched earlier.
+    const turnToolCalls: ToolCall[] = [];
+    const turnToolResults: ToolResult[] = [];
     // Track streamed content on the instance so an abort in sendMessage can
     // persist the partial answer instead of discarding it.
     this.partialContent = '';
@@ -235,6 +253,7 @@ export class ChatOrchestrator {
 
         currentModel = result.model;
         currentProvider = result.provider;
+        lastStepContent = result.content;
         fullContent += result.content;
       } catch (err: any) {
         if (err.name === 'AbortError') throw err;
@@ -253,6 +272,10 @@ export class ChatOrchestrator {
           provider: currentProvider,
           tokensUsed: totalTokens,
           sources: sources.length > 0 ? sources : undefined,
+          // Persist what was researched during this turn so follow-up
+          // questions can build on it instead of re-running every search.
+          toolCalls: turnToolCalls.length > 0 ? turnToolCalls : undefined,
+          toolResults: turnToolResults.length > 0 ? turnToolResults : undefined,
         };
         this.appendMessage(session, finalMessage);
         callbacks.onComplete(finalMessage);
@@ -347,20 +370,22 @@ export class ChatOrchestrator {
           const toolCall = pendingCalls[i];
           const result = results[i];
           callbacks.onToolResult(result);
+          turnToolCalls.push(toolCall);
+          turnToolResults.push(result);
 
           // Extract sources from tool results
           if (result.success && result.data) {
             if (result.data.results) {
               for (const r of result.data.results) {
                 if (r.url && r.title) {
-                  sources.push({ title: r.title, url: r.url, snippet: r.snippet });
+                  addSource({ title: r.title, url: r.url, snippet: r.snippet });
                 }
               }
             }
             if (result.data.articles) {
               for (const a of result.data.articles) {
                 if (a.url && a.title) {
-                  sources.push({ title: a.title, url: a.url, snippet: a.snippet, publishedAt: a.publishedAt });
+                  addSource({ title: a.title, url: a.url, snippet: a.snippet, publishedAt: a.publishedAt });
                 }
               }
             }
