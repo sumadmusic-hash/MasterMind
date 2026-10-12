@@ -179,14 +179,14 @@ class ToolRegistry {
   }
 
   toggleTool(id: string, enabled: boolean): void {
-    // Resolve near-miss ids like everywhere else — but only within the raw map
-    // (`tools.has`), never via getTool()/resolveToolId(): the fuzzy substring
-    // fallback would happily toggle a *different* tool than the one requested.
-    let resolved = id;
-    if (!this.tools.has(resolved)) {
-      const direct = [id.toLowerCase(), id.replace(/[-\s]/g, '_'), id.replace(/^get_|^fetch_|^lookup_/, ''), id.replace(/_$/, '')];
-      for (const cand of direct) if (this.tools.has(cand)) { resolved = cand; break; }
-    }
+    // Use the SAME resolution as execute()/getTool() (exact → normalized →
+    // legacy alias → unique substring). A hand-rolled "direct candidates"
+    // copy here previously lacked the legacy alias map, so toggling the
+    // historical id "weather" silently did nothing while execution still
+    // resolved it to weather_lookup — a hidden tool that could not be
+    // disabled. The unique-substring rule cannot hit an ambiguous second
+    // tool, so this can never toggle a different tool than requested.
+    const resolved = this.resolveToolId(id);
     const tool = this.tools.get(resolved);
     if (tool) {
       tool.enabled = enabled;

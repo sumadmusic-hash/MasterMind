@@ -43,7 +43,11 @@ class TokenPerMinuteManager {
    * the oldest in-flight entries to age out and re-check.
    */
   private estimateWaitMs(tokens: number): number {
-    const inflight = [...this.usageLog.values()].sort((a, b) => a.timestamp - b.timestamp);
+    // usageLog is a plain array — iterate it directly (Map-style `.values()`
+    // on an array yields the *index keys* "0","1",… as strings, so every
+    // `entry.tokens` below was undefined and the estimate silently degraded
+    // to a fixed full-window wait).
+    const inflight = [...this.usageLog].sort((a, b) => a.timestamp - b.timestamp);
     if (inflight.length === 0) return this.windowMs;
     // Walk oldest-first until enough tokens would be freed by aging out
     let freed = 0;
