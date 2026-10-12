@@ -209,6 +209,23 @@ export function SettingsPage() {
               />
             </div>
 
+            <div>
+              <label className="text-sm text-gray-400 mb-1 block">Max. Wartezeit bei Budget-Erschöpfung (ms)</label>
+              <input
+                type="number"
+                value={settings.tpmWaitTimeoutMs ?? 300000}
+                onChange={e => updateSettings({ tpmWaitTimeoutMs: Math.max(0, parseInt(e.target.value) || 300000) })}
+                min={0}
+                step={10000}
+                className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Aufgaben, die das TPM-Limit überschreiten, werden nicht abgebrochen, sondern pausieren und
+                fortgesetzt, sobald wieder Token-Budget frei ist. Dieser Wert begrenzt, wie lange maximal
+                gewartet wird (0 = sofort fehlschlagen). Bereits bearbeitete Schritte gehen dabei nie verloren.
+              </p>
+            </div>
+
             {/* Current usage */}
             <div className="bg-gray-800/50 rounded-lg p-3">
               <div className="text-xs text-gray-500 mb-2">Current Window Usage</div>
