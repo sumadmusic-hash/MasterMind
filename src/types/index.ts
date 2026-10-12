@@ -15,8 +15,14 @@ export const AppSettingsSchema = z.object({
   groqApiKey: z.string().optional(),
   openRouterApiKey: z.string().optional(),
   primaryModel: ModelConfigSchema,
+  // Fallback-Kette: bis zu 6 Modelle, der Reihe nach ausprobiert, wenn das
+  // vorherige Modell fehlschlägt (Rate-Limit, Serverfehler, fehlender API-Key …).
   fallback1: ModelConfigSchema.optional(),
   fallback2: ModelConfigSchema.optional(),
+  fallback3: ModelConfigSchema.optional(),
+  fallback4: ModelConfigSchema.optional(),
+  fallback5: ModelConfigSchema.optional(),
+  fallback6: ModelConfigSchema.optional(),
   globalTpmLimit: z.number().min(1000).default(100000),
   perProviderLimits: z.record(z.string(), z.number()).optional(),
   maxTokensPerRequest: z.number().default(4096),
