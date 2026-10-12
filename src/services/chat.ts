@@ -739,7 +739,8 @@ export class ChatOrchestrator {
       // Budget exhausted: force synthesis in the NEXT provider call. Without
       // this nudge the model tends to emit yet another tool-call step that
       // gets fully skipped — a wasted round-trip billing the whole history.
-      if (this.toolCallCount >= this.maxToolCallsPerTurn) {
+      const budgetExhausted = this.toolCallCount >= this.maxToolCallsPerTurn;
+      if (budgetExhausted) {
         messages.push({
           role: 'user',
           content: 'Tool-Budget erschöpft. Erstelle JETZT die finale Antwort aus dem gesammelten Material (inkl. Quellen-Array); keine weiteren Tool-Aufrufe.',
@@ -753,6 +754,102 @@ export class ChatOrchestrator {
 
       if (lastStepContent.trim().length > 0) {
         this.partialContent = lastStepContent;
+      }
+
+      // If the budget nudge above was injected, give the model exactly ONE
+      // more call to synthesize its final answer. Previously the loop kept
+      // iterating until `maxToolSteps` even though no further tool could
+      // execute — every remaining step re-billed the entire history as prompt
+      // tokens for answers that would then be discarded by the max-steps
+      // fallback. With the typical settings (maxToolSteps 20, budget 4) a
+      // single question could burn ~16 pointless round-trips.
+      if (budgetExhausted) {
+        callbacks.onStatus('Synthesizing final answer...');
+        let finalContent = '';
+        try {
+          const result = await callProvider(
+            settings,
+            [...messages],
+            undefined, // no tools offered — the model MUST answer from collected material
+            {
+              onToolCall: () => {}, // tools are not offered in the synthesis call
+              onToken: (token: string) => {
+                finalContent += token;
+                this.partialContent += token;
+                callbacks.onToken(token);
+              },
+              onComplete: (_content: string, usage: any) => {
+                totalTokens += usage.totalTokens;
+              },
+              onError: (err: Error) => {
+                callbacks.onError(err.message);
+              },
+              onBudgetWait: (waitMs, waitedMs) => {
+                const secs = Math.max(1, Math.round(waitMs / 1000));
+                const waited = Math.round(waitedMs / 1000);
+                callbacks.onStatus(
+                  `Token-Limit erreicht – warte auf Budget (${secs}s${waited > 0 ? `, wartet seit ${waited}s` : ''})…`
+                );
+              },
+              onModelSwitch: (modelId, provider, attempt) => {
+                if (attempt > 1) {
+                  finalContent = '';
+                  this.partialContent = '';
+                }
+                currentModel = modelId;
+                currentProvider = provider;
+              },
+            },
+            this.abortController?.signal
+          );
+          currentModel = result.model;
+          currentProvider = result.provider;
+          // The streamed text already accumulated in `finalContent`; prefer it
+          // over `result.content` only if streaming delivered something (both
+          // should match — this guards against providers that report content
+          // without forwarding tokens).
+          const answerText = finalContent || result.content;
+          if (answerText.trim().length > 0) {
+            fullContent += (fullContent ? '\n\n' : '') + answerText;
+          }
+        } catch (err: any) {
+          if (err.name === 'AbortError') throw err;
+          // Synthesis failed after the budget was spent: persist everything
+          // accomplished so far as a resumable interrupted turn instead of
+          // letting the outer catch discard the progress silently.
+          return {
+            interruption: {
+              err,
+              ctx: {
+                partialContent: this.partialContent,
+                stepContents,
+                turnToolCalls,
+                turnToolResults,
+                sources,
+                model: currentModel,
+                provider: currentProvider,
+                tokens: totalTokens,
+              },
+            },
+          };
+        }
+        // Final answer produced — end the turn immediately.
+        const finalMessage: ChatMessage = {
+          id: crypto.randomUUID(),
+          role: 'assistant',
+          content: fullContent,
+          timestamp: Date.now(),
+          model: currentModel,
+          provider: currentProvider,
+          tokensUsed: totalTokens,
+          sources: sources.length > 0 ? sources : undefined,
+          toolCalls: turnToolCalls.length > 0 ? turnToolCalls : undefined,
+          toolResults: turnToolResults.length > 0 ? turnToolResults : undefined,
+        };
+        this.appendMessage(session, finalMessage);
+        callbacks.onComplete(finalMessage);
+        callbacks.onStatus('Complete');
+        return;
       }
     }
 
