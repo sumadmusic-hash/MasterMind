@@ -163,6 +163,9 @@ export function ChatPage() {
     setTimeout(() => setCopiedId(null), 2000);
   }, []);
 
+  // Derive a session title from the first user message (max 50 chars).
+  const deriveSessionTitle = (text: string) => text.trim().substring(0, 50);
+
   const handleSend = async () => {
     if (!input.trim() || streaming) return;
     if (!state.settings) {
@@ -176,11 +179,16 @@ export function ChatPage() {
     // spread `[...currentSession.messages, message]` — which already contained
     // the just-pushed final message — so the assistant reply (and with a stale
     // closure even the whole history) was rendered/stored twice.
+    // BUGFIX: the title was only derived from `userInput` inside onComplete,
+    // which never fires on error/abort paths — sessions created via
+    // createNewSession (title "New Chat") therefore kept the placeholder after
+    // a failed turn. Set the real title up-front, before the request is sent,
+    // for every new session regardless of how the turn ends.
     let currentSession: ChatSession = session
       ? { ...session, messages: [...session.messages] }
       : {
           id: crypto.randomUUID(),
-          title: input.substring(0, 50),
+          title: deriveSessionTitle(input),
           messages: [],
           createdAt: Date.now(),
           updatedAt: Date.now(),
@@ -190,6 +198,16 @@ export function ChatPage() {
       dispatch({
         type: 'SET_CHAT_SESSIONS',
         payload: [currentSession, ...state.chatSessions],
+      });
+    } else if (currentSession.title === 'New Chat' && state.chatSessions.some(s => s.id === currentSession.id)) {
+      // Session existed with the placeholder title — rename it now so the
+      // sidebar and persistence reflect the first user message immediately.
+      currentSession = { ...currentSession, title: deriveSessionTitle(input) };
+      dispatch({
+        type: 'SET_CHAT_SESSIONS',
+        payload: state.chatSessions.map(s =>
+          s.id === currentSession.id ? { ...s, title: currentSession.title } : s
+        ),
       });
     }
 
@@ -233,10 +251,8 @@ export function ChatPage() {
               ...currentSession,
               messages: [...currentSession.messages],
               updatedAt: Date.now(),
-              title: message.role === 'assistant' &&
-                currentSession.messages.filter(m => m.role === 'user').length <= 1 &&
-                currentSession.title === 'New Chat'
-                ? userInput.substring(0, 50)
+              title: currentSession.title === 'New Chat'
+                ? deriveSessionTitle(userInput)
                 : currentSession.title,
             };
             syncSession(updated);

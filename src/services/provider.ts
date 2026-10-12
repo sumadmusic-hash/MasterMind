@@ -403,12 +403,37 @@ async function executeProviderCall(
     headers['X-Title'] = 'AI Research Assistant';
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal: abortSignal,
-  });
+  // Enforce settings.maxCallDuration: previously this value was persisted and
+  // shown in Settings but never applied — a hung provider request (or a stream
+  // that stalls mid-response) would block the agent loop indefinitely. Combine
+  // the caller's abort signal with a per-call timeout signal so BOTH user aborts
+  // (Esc / "Abbrechen") and the timeout cancel the fetch. AbortError keeps its
+  // name, so callProvider's `err.name === 'AbortError'` rethrow still works.
+  const timeoutSignal = AbortSignal.timeout(
+    Math.max(1000, settings.maxCallDuration || 120000)
+  );
+  const combinedSignal = abortSignal
+    ? AbortSignal.any([abortSignal, timeoutSignal])
+    : timeoutSignal;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: combinedSignal,
+    });
+  } catch (err: any) {
+    if (timeoutSignal.aborted && !abortSignal?.aborted) {
+      const tErr = new Error(
+        `Modell-Aufruf nach ${settings.maxCallDuration}ms abgebrochen (maxCallDuration überschritten).`
+      );
+      tErr.name = 'TimeoutError';
+      throw tErr;
+    }
+    throw err;
+  }
 
   if (!response.ok) {
     const errorBody = await response.text();
