@@ -2002,16 +2002,52 @@ function round2(v: number): number {
   return Number.isFinite(v) ? Math.round(v * 100) / 100 : v;
 }
 
+/**
+ * Map user/model-friendly names to Yahoo Finance symbols. Without this, a
+ * query like "DAX kurs" fails because the model passes the bare name "DAX"
+ * (or a German index name), which Yahoo does not resolve — only the correct
+ * exchange symbol (e.g. ^GDAXI for the DAX) returns data.
+ */
+const TICKER_ALIASES: Record<string, string> = {
+  // German stock indices (Xetra/DAX family). Symbols verified against the
+  // Yahoo chart API; e.g. bare "^DAX"/"^MDAX" return 404 — only these work.
+  'DAX': '^GDAXI',
+  'DAX40': '^GDAXI',
+  'MDAX': '^MDAXI',
+  'SDAX': '^SDAXI',
+  'TECDAX': '^TECDAX',
+  'DIVDAX': 'DT5K.DE',
+  // International indices
+  '^GSPC': '^GSPC',
+  'SP500': '^GSPC',
+  'S&P500': '^GSPC',
+  'NASDAQ100': '^NDX',
+  'NIKKEI': '^N225',
+  'FTSE': '^FTSE',
+  // Cryptos (frequently asked without exchange suffix)
+  'BITCOIN': 'BTC-USD',
+  'BTC': 'BTC-USD',
+  'ETHER': 'ETH-USD',
+  'ETH': 'ETH-USD',
+};
+
+function resolveTicker(raw: unknown): string {
+  const t = String(raw ?? '').trim().toUpperCase();
+  if (!t) return t;
+  const compact = t.replace(/[\s._-]/g, ''); // "Dax 40", "Tec-DAX" → "DAX40", "TECDAX"
+  return TICKER_ALIASES[t] || TICKER_ALIASES[compact] || t;
+}
+
 // Stock Price Tool
 toolRegistry.register({
   id: 'stock_price',
   name: 'Stock Price',
-  description: 'Get current and historical stock price data for a ticker symbol.',
+  description: 'Get current and historical stock price data for a ticker symbol. German indices work by name (DAX, MDAX, SDAX, TecDAX, DivDAX); also supports ^GSPC, Bitcoin etc.',
   category: 'data_source',
   inputSchema: {
     type: 'object',
     properties: {
-      ticker: { type: 'string', description: 'Stock ticker symbol (e.g., AAPL, NVDA, SIE.DE)' },
+      ticker: { type: 'string', description: 'Stock ticker / index name (e.g., AAPL, NVDA, SIE.DE, DAX, TecDAX)' },
       days: { type: 'number', description: 'Days of historical data (default 7)' },
     },
     required: ['ticker'],
@@ -2033,7 +2069,7 @@ toolRegistry.register({
   builtin: true,
 }, async (args) => {
   // Use a free financial data source
-  const ticker = args.ticker.toUpperCase();
+  const ticker = resolveTicker(args.ticker);
   const days = args.days || 7;
   
   try {
@@ -2094,14 +2130,15 @@ toolRegistry.register({
   id: 'stock_analysis',
   name: 'Stock Analysis',
   description:
-    'Kursanalyse für ein Wertpapier im Zeitraum: berechnet Performance, annualisierte Volatilität, ' +
+    'Kursanalyse für ein Wertpapier oder einen Index im Zeitraum: berechnet Performance, annualisierte Volatilität, ' +
     'maximalen Drawdown, Durchschnittsvolumen und gleitenden Durchschnitt aus den Tages-/Wochen-/Monatskursen ' +
-    '(OHLCV). Für Kennzahlen wie KGV/Dividende stattdessen company_lookup verwenden.',
+    '(OHLCV). Indizes direkt abfragbar (ticker: "DAX", "MDAX", "SDAX", "TecDAX", "^GSPC", "Bitcoin"). ' +
+    'Für Kennzahlen wie KGV/Dividende stattdessen company_lookup verwenden.',
   category: 'transform',
   inputSchema: {
     type: 'object',
     properties: {
-      ticker: { type: 'string', description: 'Ticker (AAPL, NVDA, SIE.DE, ...)' },
+      ticker: { type: 'string', description: 'Ticker oder Indexname (AAPL, NVDA, SIE.DE, DAX, MDAX, TecDAX, ^GSPC, Bitcoin, ...)' },
       period: { type: 'string', enum: ['1mo', '3mo', '6mo', '1y', '2y', '5y'], description: 'Zeitraum (default 6mo)' },
       interval: { type: 'string', enum: ['1d', '1wk', '1mo'], description: 'Kursintervall (default 1d)' },
     },
@@ -2115,7 +2152,7 @@ toolRegistry.register({
   maxDataSize: 40000,
   builtin: true,
 }, async (args) => {
-  const ticker = String(args.ticker).toUpperCase();
+  const ticker = resolveTicker(args.ticker);
   const period = ['1mo','3mo','6mo','1y','2y','5y'].includes(args.period) ? args.period : '6mo';
   const interval = ['1d','1wk','1mo'].includes(args.interval) ? args.interval : '1d';
 
