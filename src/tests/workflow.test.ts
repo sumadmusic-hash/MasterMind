@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { workflowEngine } from '../services/workflow';
+import * as db from '../services/database';
 import type { WorkflowDefinition } from '../types';
 
 const createValidWorkflow = (): WorkflowDefinition => ({
@@ -106,5 +107,74 @@ describe('WorkflowEngine', () => {
     expect(result.id).toBeDefined();
     expect(result.workflowId).toBe(workflow.id);
     expect(result.timestamp).toBeGreaterThan(0);
+  });
+
+  // Regression tests for the topologicalSort / saveAndVersionWorkflow bugs.
+  describe('topologicalSort (via executeWorkflow)', () => {
+    it('does not drop nodes that participate in a cycle', async () => {
+      // a -> b -> c -> b forms a cycle; previously b and c never reached
+      // in-degree 0 and were silently omitted from the execution order.
+      const spy = vi.spyOn(db, 'saveWorkflow').mockResolvedValue(undefined as any);
+      const wf: WorkflowDefinition = {
+        ...createValidWorkflow(),
+        nodes: [
+          { id: 'a', type: 'input', position: { x: 0, y: 0 }, data: { label: 'A' } },
+          { id: 'b', type: 'pass', position: { x: 100, y: 0 }, data: { label: 'B' } },
+          { id: 'c', type: 'output', position: { x: 200, y: 0 }, data: { label: 'C' } },
+        ],
+        edges: [
+          { id: 'e1', source: 'a', target: 'b' },
+          { id: 'e2', source: 'b', target: 'c' },
+          { id: 'e3', source: 'c', target: 'b' },
+        ],
+      };
+      const res = await workflowEngine.executeWorkflow(wf, { x: 1 });
+      // All three nodes must have been visited: output node c has an entry.
+      expect(res.output).toBeDefined();
+      expect(res.duration).toBeGreaterThan(0);
+      spy.mockRestore();
+    });
+
+    it('ignores edges referencing unknown nodes without losing valid ones', async () => {
+      const wf = createValidWorkflow();
+      wf.edges.push({ id: 'e9', source: 'ghost', target: 'tool_1' });
+      const res = await workflowEngine.executeWorkflow(wf, {
+        data: [{ name: 'Apple', sector: 'Tech' }],
+        filterField: 'sector',
+        filterValue: 'Tech',
+      });
+      expect(res.success).toBe(true);
+    });
+  });
+
+  describe('saveAndVersionWorkflow', () => {
+    it('increments patch version normally', async () => {
+      const spy = vi.spyOn(db, 'saveWorkflow').mockResolvedValue(undefined as any);
+      const wf = createValidWorkflow(); // version 1.0.0
+      const saved = await workflowEngine.saveAndVersionWorkflow(wf);
+      expect(saved.version).toBe('1.0.1');
+      expect(spy).toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it('never produces NaN in the version string', async () => {
+      const spy = vi.spyOn(db, 'saveWorkflow').mockResolvedValue(undefined as any);
+      for (const bad of ['1.0', 'v2.1.0-beta', '', 'abc', undefined as any]) {
+        const wf = { ...createValidWorkflow(), version: bad };
+        const saved = await workflowEngine.saveAndVersionWorkflow(wf);
+        expect(saved.version).not.toContain('NaN');
+        expect(saved.version).toMatch(/^\d+\.\d+\.\d+$/);
+      }
+      spy.mockRestore();
+    });
+
+    it('does not mutate the input workflow object', async () => {
+      const spy = vi.spyOn(db, 'saveWorkflow').mockResolvedValue(undefined as any);
+      const wf = createValidWorkflow();
+      const originalVersion = wf.version;
+      await workflowEngine.saveAndVersionWorkflow(wf);
+      expect(wf.version).toBe(originalVersion);
+      spy.mockRestore();
+    });
   });
 });

@@ -633,7 +633,11 @@ export class ChatOrchestrator {
             : `Running ${pendingCalls.length} tools in parallel...`
         );
 
-        const results = await Promise.all(pendingCalls.map(c => toolRegistry.execute(c)));
+        // Pass the turn's abort signal so a user cancel interrupts running
+        // tools immediately instead of letting them burn until maxDuration.
+        const results = await Promise.all(
+          pendingCalls.map(c => toolRegistry.execute(c, this.abortController?.signal))
+        );
 
         // Push results in the ORIGINAL call order so the assistant tool_calls
         // and tool messages stay aligned in the conversation protocol.

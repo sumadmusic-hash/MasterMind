@@ -94,7 +94,22 @@ class ToolRegistry {
     return hits.length === 1 ? hits[0] : id;
   }
 
-  async execute(call: ToolCall): Promise<ToolResult> {
+  async execute(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+    // If the caller (user abort / turn cancellation) was already aborted, do
+    // not even start the tool — previously execute() ignored the abort signal
+    // entirely and ran every queued tool to completion (or maxDuration timeout)
+    // after the user pressed "Abbrechen".
+    if (signal?.aborted) {
+      return {
+        callId: call.id,
+        toolId: call.toolId,
+        success: false,
+        error: 'Abgebrochen: Tool-Ausführung wurde nicht gestartet (Abort-Signal).',
+        duration: 0,
+        timestamp: Date.now(),
+      };
+    }
+
     const startTime = Date.now();
     // The model sometimes emits an id it invented or renamed ("weather" after
     // the weather_lookup rename, "get_weather", …). Resolve near-misses instead
@@ -150,13 +165,32 @@ class ToolRegistry {
       };
     }
 
+    // Abort handling: race the implementation against the caller's abort
+    // signal too, so a user cancel during a long-running tool (search, fetch)
+    // ends the call immediately instead of waiting for maxDuration.
+    let unsubscribeAbort: (() => void) | undefined;
     try {
       // Timeout handling
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => reject(new Error(`Tool timeout after ${tool.maxDuration}ms`)), tool.maxDuration);
       });
 
-      const result = await Promise.race([impl(call.arguments), timeoutPromise]);
+      const abortPromise: Promise<never> | null = signal
+        ? new Promise<never>((resolve, reject) => {
+            const onAbort = () => reject(Object.assign(new Error('Tool-Ausführung abgebrochen.'), { name: 'AbortError' }));
+            if (signal.aborted) { onAbort(); return; }
+            signal.addEventListener('abort', onAbort, { once: true });
+            unsubscribeAbort = () => signal.removeEventListener('abort', onAbort);
+            void resolve;
+          })
+        : null;
+
+      const result = await Promise.race([
+        impl(call.arguments),
+        timeoutPromise,
+        ...(abortPromise ? [abortPromise] : []),
+      ]);
+      unsubscribeAbort?.();
       
       return {
         callId: call.id,
@@ -167,6 +201,7 @@ class ToolRegistry {
         timestamp: Date.now(),
       };
     } catch (err: any) {
+      unsubscribeAbort?.();
       return {
         callId: call.id,
         toolId: call.toolId,

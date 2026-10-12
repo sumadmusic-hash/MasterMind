@@ -218,6 +218,19 @@ class WorkflowEngine {
       }
     }
 
+    // BUGFIX: nodes that are part of a cycle (or only reachable through one)
+    // never reach in-degree 0 and were silently DROPPED from the order — the
+    // workflow then "succeeded" while whole branches were never executed.
+    // Append every node missing from `result` (deterministic: original node
+    // order) so all nodes run at least once; validateWorkflow still flags
+    // cycles as errors, but execution no longer loses work invisibly.
+    if (result.length !== nodes.length) {
+      const seen = new Set(result);
+      for (const node of nodes) {
+        if (!seen.has(node.id)) result.push(node.id);
+      }
+    }
+
     return result;
   }
 
@@ -251,14 +264,31 @@ class WorkflowEngine {
   }
 
   async saveAndVersionWorkflow(workflow: WorkflowDefinition): Promise<WorkflowDefinition> {
-    // Increment version
-    const parts = workflow.version.split('.').map(Number);
-    parts[2] = (parts[2] || 0) + 1;
-    workflow.version = parts.join('.');
-    workflow.updatedAt = Date.now();
-    
-    await saveWorkflow(workflow);
-    return workflow;
+    // BUGFIX (1): `split('.').map(Number)` produced NaN for non-numeric or
+    // missing version parts ("1.0", "v1.0.0-beta", ""), which then leaked into
+    // the stored version string as e.g. "1.NaN.2" or "NaN.NaN.1". Parse each
+    // part defensively with a numeric fallback instead.
+    // BUGFIX (2): the old code MUTATED the caller's workflow object; work on a
+    // copy so callers can still compare/rollback their own state.
+    const rawParts = String(workflow.version || '').trim().replace(/^v/i, '').split('.');
+    const num = (v: string | undefined, fallback: number) => {
+      const n = Number.parseInt(v ?? '', 10);
+      return Number.isFinite(n) && n >= 0 ? n : fallback;
+    };
+    const parts = [
+      num(rawParts[0], 1),
+      num(rawParts[1], 0),
+      num(rawParts[2], 0) + 1, // increment patch version
+    ];
+
+    const updated: WorkflowDefinition = {
+      ...workflow,
+      version: parts.join('.'),
+      updatedAt: Date.now(),
+    };
+
+    await saveWorkflow(updated);
+    return updated;
   }
 
   generateWorkflowFromDescription(description: string): WorkflowDefinition {
