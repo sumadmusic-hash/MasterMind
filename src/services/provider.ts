@@ -365,7 +365,12 @@ async function executeProviderCall(
   }
 }
 
-async function handleStreamingResponse(
+/**
+ * Exported for tests: parses an OpenAI-style SSE stream, reassembles streamed
+ * tool-call deltas (see the accumulator in the body) and emits exactly one
+ * complete call per tool call via `callbacks.onToolCall`.
+ */
+export async function handleStreamingResponse(
   response: Response,
   callbacks: StreamCallbacks,
   requestMessages?: ProviderMessage[]
@@ -377,6 +382,31 @@ async function handleStreamingResponse(
   let fullContent = '';
   let promptTokens = 0;
   let completionTokens = 0;
+  /**
+   * Streaming tool calls arrive as DELTAS, not as complete objects: the first
+   * chunk carries `{index, id, type, function:{name}}` and every following
+   * chunk carries only a fragment of `function.arguments` (with an empty/
+   * missing name and often no id at all). Forwarding each raw delta to
+   * `onToolCall` used to register one "tool call" per fragment — producing
+   * calls with an empty tool name ("Tool not found: ") or with only the first
+   * letters of the arguments (`{"q` → parsed to `{}`, so web_search reported
+   * 'Pflicht-Parameter "query" fehlt'). Reassemble deltas by `index` here and
+   * emit exactly ONE complete call per tool call when the stream ends.
+   */
+  interface ToolCallAccumulator { id?: string; name: string; arguments: string }
+  const toolCallAccumulators = new Map<number, ToolCallAccumulator>();
+  let anonymousCallSeq = 0;
+  const flushToolCalls = () => {
+    for (const [, acc] of toolCallAccumulators) {
+      if (!acc.name && !acc.arguments) continue; // nothing meaningful streamed
+      callbacks.onToolCall({
+        id: acc.id || `call_stream_${anonymousCallSeq++}`,
+        type: 'function',
+        function: { name: acc.name, arguments: acc.arguments || '{}' },
+      });
+    }
+    toolCallAccumulators.clear();
+  };
   // SSE frames must be reassembled across network-chunk boundaries: a single
   // `data:` line can be split over two chunks (and one chunk can contain many
   // lines). Previously every partial line was fed to JSON.parse and silently
@@ -384,6 +414,9 @@ async function handleStreamingResponse(
   // didn't align with SSE line breaks.
   let buffer = '';
   let sawDone = false;
+  // Tracks the most recent tool-call delta index, so continuation chunks that
+  // omit `index` still merge into the right accumulator (see above).
+  let lastToolCallIndex: number | undefined;
 
   const processLine = (rawLine: string) => {
     const line = rawLine.replace(/\r$/, '');
@@ -392,6 +425,7 @@ async function handleStreamingResponse(
     const data = rest.startsWith(' ') ? rest.slice(1) : rest;
     if (data === '[DONE]') {
       sawDone = true;
+      flushToolCalls();
       return;
     }
 
@@ -406,7 +440,18 @@ async function handleStreamingResponse(
 
       if (delta?.tool_calls) {
         for (const tc of delta.tool_calls) {
-          callbacks.onToolCall(tc);
+          // Some providers omit `index` on continuation chunks; fall back to
+          // the most recently seen index so fragments still merge correctly.
+          const idx = typeof tc.index === 'number' ? tc.index : (lastToolCallIndex ?? 0);
+          lastToolCallIndex = idx;
+          let acc = toolCallAccumulators.get(idx);
+          if (!acc) {
+            acc = { id: tc.id, name: '', arguments: '' };
+            toolCallAccumulators.set(idx, acc);
+          }
+          if (tc.id) acc.id = tc.id;
+          if (tc.function?.name) acc.name += tc.function.name;
+          if (typeof tc.function?.arguments === 'string') acc.arguments += tc.function.arguments;
         }
       }
 
@@ -441,6 +486,10 @@ async function handleStreamingResponse(
       processLine(buffer);
       buffer = '';
     }
+
+    // Providers may close the stream without a `[DONE]` sentinel: make sure
+    // accumulated tool-call fragments are still emitted exactly once.
+    flushToolCalls();
   } catch (err: any) {
     if (err.name === 'AbortError') {
       callbacks.onComplete(fullContent, {
