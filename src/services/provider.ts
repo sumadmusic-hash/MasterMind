@@ -114,6 +114,37 @@ export class EmptyResponseError extends Error {
   }
 }
 
+/**
+ * Error thrown when a provider rejects the request's credentials (HTTP 401/403).
+ *
+ * This is NOT a transient infrastructure failure: every model that references
+ * the same provider will fail with the identical error, and resuming the turn
+ * ("Fortsetzen") without fixing the API key just re-sends the whole prompt
+ * (system prompt + history + tool catalogue) for nothing — observed as ~9-13k
+ * tokens burned per attempt with no answer ever arriving. Callers must treat
+ * this as fatal-and-non-resumable (`auth = true`, `refusal` deliberately NOT
+ * set so the turn is not offered for resume) until the key is corrected.
+ */
+export class AuthProviderError extends Error {
+  readonly auth = true as const;
+  readonly failedProvider: string;
+
+  constructor(provider: string) {
+    super(`Authentication failed for ${provider}. Check your API key.`);
+    this.name = 'AuthProviderError';
+    this.failedProvider = provider;
+  }
+}
+
+/** True when an error stems from invalid/missing provider credentials (401/403). */
+export function isAuthError(err: any): boolean {
+  return err instanceof AuthProviderError ||
+    err?.auth === true ||
+    err?.name === 'AuthProviderError' ||
+    err?.status === 401 ||
+    err?.status === 403;
+}
+
 /** Error thrown when a model answers but refuses the request (content policy). */
 export class ModelRefusalError extends Error {
   readonly refusal = true as const;
@@ -225,6 +256,19 @@ export async function callProvider(
   // "all models declined" apart from "all models errored" — and must NOT treat
   // a refusal as a reason to re-run work that was already completed.
   let sawRefusal = false;
+  // Track whether any slot actually reached the network this request. If not,
+  // an eventual AuthProviderError would be misleading (no key was ever tested).
+  let attemptedAnyCall = false;
+  // Auth failure tracking: a 401/403 means the stored API key for THIS provider
+  // is invalid. Models of OTHER providers in the chain can still answer, so we
+  // skip every slot of the broken provider (see `authFailedProviders` below)
+  // instead of letting each one fail with the same error. If NO model could
+  // answer at all, the final error is an AuthProviderError — fatal and NOT
+  // resumable, because "Fortsetzen" would re-send the entire prompt (system
+  // prompt + history + tools, observed ~9-13k tokens per click) and hit the
+  // identical 401 again without ever producing an answer.
+  const authFailedProviders = new Set<string>();
+  let sawAuthFailure = false;
   // Config errors (e.g. "Unknown provider") are thrown synchronously by
   // getApiUrl for EVERY slot that references the same broken provider string.
   // Retrying them against all 7 fallbacks just repeats the identical failure
@@ -233,6 +277,11 @@ export async function callProvider(
 
   for (let attemptIdx = 0; attemptIdx < modelConfigs.length; attemptIdx++) {
     const config = modelConfigs[attemptIdx];
+    // Provider's key already proven invalid this request: don't even reserve
+    // TPM budget or send the prompt again — skip straight to the next slot.
+    if (authFailedProviders.has(config.provider)) {
+      continue;
+    }
     let apiUrl: string;
     try {
       apiUrl = getApiUrl(config.provider);
@@ -335,11 +384,23 @@ export async function callProvider(
         continue;
       }
 
-      // Check if error is retryable
+      // Auth failure (401/403): the key for THIS provider is invalid. Do NOT
+      // abort the whole chain here — other providers' models can still answer.
+      // Remember the broken provider so every remaining slot referencing it is
+      // skipped without re-sending the (expensive) prompt, then fall through to
+      // the next model. If nothing in the chain answers, the final error below
+      // becomes an AuthProviderError (fatal, non-resumable).
       if (err.status === 401 || err.status === 403) {
-        throw new Error(`Authentication failed for ${config.provider}. Check your API key.`);
+        sawAuthFailure = true;
+        authFailedProviders.add(config.provider);
+        await addLog({
+          level: 'warn',
+          message: `Authentifizierung fehlgeschlagen für ${config.provider} (${config.modelId}) – API-Key prüfen; Modell wird übersprungen.`,
+          timestamp: Date.now(),
+        });
+        continue;
       }
-      
+
       if (err.status === 429) {
         // Rate limited, try fallback
         continue;
@@ -353,6 +414,16 @@ export async function callProvider(
       // For other errors, also try fallback
       continue;
     }
+  }
+
+  // No model answered and at least one provider rejected the credentials:
+  // surface the AUTH problem as the final error (not a generic last-error like
+  // a downstream budget/timeout message). AuthProviderError is fatal and NOT
+  // marked as refusal — chat.ts must not offer "Fortsetzen" for it, because a
+  // resume without a corrected API key re-sends the whole prompt (~9-13k
+  // tokens) only to hit the identical 401 again.
+  if (sawAuthFailure) {
+    throw new AuthProviderError([...authFailedProviders].join(', '));
   }
 
   // If at least one model refused and none answered, mark the final error as a
