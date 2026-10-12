@@ -1,4 +1,5 @@
 import type { ToolDefinition, ToolCall, ToolResult, Source } from '../types';
+import { getSettings } from './database';
 
 /**
  * Reject unknown / misspelled argument names instead of silently ignoring them.
@@ -457,6 +458,236 @@ toolRegistry.register({
     query: args.query,
     hoursBack,
     ...(articles.length === 0 && errors.length ? { error: errors.join('; ') } : {}),
+  };
+});
+
+// ============ Webz.io News API (https://app.webz.io/) ============
+//
+// Nutzung der API (Stand: Recherche Okt. 2026):
+// - Endpunkt:    GET https://api.webz.io/search?token=<TOKEN>&format=json&query=...
+//   (live verifiziert: unbekannte Token → HTTP 401 "Unknown API token <x>",
+//    alle anderen Pfade auf api.webz.io liefern 404 — "search" ist der News-Endpunkt)
+// - Auth:        Token als Query-Parameter, kein OAuth/Header. Das Token gibt es
+//                nach Registrierung im Dashboard: https://app.webz.io/ (API-Token-Seite).
+// - Parameter:   query (Pflicht), size (1..100, Standard 10), dateFilter ("Today"/
+//                "Last2Days"/"Last7Days"/"Last30Days"), dateFrom/dateTo (YYYY-MM-DD),
+//                language (ISO 639-1, z. B. "de"), category, sourceLocation, includeHtml,
+//                userFields, format=json|rss|xml, orderBy=date|relevance, pageType, cursor.
+// - Antwort:     { took, hits: [{ title, url, description, snippet, image, date,
+//                thirdPartyId, siteParameters: { name, domain, lang, isFakeNews } }] }
+// - CORS:        api.webz.io sendet KEINE Access-Control-Allow-Origin-Headers; ein
+//                direkter Browser-Fetch wird daher vom Browser blockiert. Lösung:
+//                Requests laufen über den Vite-Dev-Proxy (/webz-api → api.webz.io)
+//                bzw. eine konfigurierbare Proxy-Basis (Settings: webzApiBaseUrl).
+
+/** Basis-URL für Webz-Aufrufe: Dev-Proxy, konfigurierbare Proxy-Basis oder direkt. */
+async function getWebzBaseUrl(): Promise<string> {
+  try {
+    const settings = await getSettings();
+    const custom = String(settings?.webzApiBaseUrl || '').trim().replace(/\/+$/, '');
+    if (custom) return custom;
+  } catch { /* IndexedDB nicht verfügbar (Tests) → Default-Proxy */ }
+  // /webz-api ist im Vite-Dev-Server als Rewrite-Proxy auf https://api.webz.io definiert.
+  return '/webz-api';
+}
+
+function webzDateFilter(hoursBack: number): string {
+  if (hoursBack <= 24) return 'Today';
+  if (hoursBack <= 48) return 'Last2Days';
+  if (hoursBack <= 168) return 'Last7Days';
+  return 'Last30Days';
+}
+
+/** Mappt einen Webz-Treffer auf das gemeinsame Source-Schema der App. */
+function mapWebzHit(hit: any): Source & { content?: string } {
+  const site = hit?.siteParameters || {};
+  return {
+    title: String(hit.title || '(ohne Titel)'),
+    url: String(hit.url || ''),
+    snippet: String(hit.description || hit.snippet || ''),
+    publishedAt: hit.date ? new Date(Number(hit.date)).toISOString() : undefined,
+    provider: `webz:${site.domain || 'unknown'}`,
+    sourceName: site.name || undefined,
+    isFakeNewsFlag: site.isFakeNews === true,
+    content: hit.content ? String(hit.content).slice(0, 500) : undefined,
+  } as any;
+}
+
+async function fetchWebzJson(params: Record<string, string | number | boolean>): Promise<any> {
+  const settings = await getSettings().catch(() => null);
+  const token = String(settings?.webzApiToken || '').trim();
+  if (!token) {
+    throw new Error(
+      'Kein Webz.io-API-Token hinterlegt. Bitte unter Einstellungen → API Keys → "Webz.io News API Token" ' +
+      'das Token aus dem Dashboard (https://app.webz.io/) eintragen.'
+    );
+  }
+  const base = await getWebzBaseUrl();
+  const qs = new URLSearchParams({ token, format: 'json', ...toQueryParams(params) });
+  const resp = await fetch(`${base}/search?${qs}`, { signal: AbortSignal.timeout(10000) });
+
+  if (resp.status === 401) {
+    throw new Error('Webz.io: ungültiges API-Token (HTTP 401). Token in den Einstellungen prüfen (Dashboard: https://app.webz.io/).');
+  }
+  if (resp.status === 429) {
+    throw new Error('Webz.io: Rate-Limit erreicht (HTTP 429). Weniger/vorsichtigere Anfragen oder Plan-Quota prüfen.');
+  }
+  if (!resp.ok) {
+    throw new Error(`Webz.io: HTTP ${resp.status}`);
+  }
+  // Bei Proxy-/HTML-Fehlantworten (z. B. laufender Server ohne /webz-api-Proxy)
+  // liefert response.json() einen SyntaxError — als klare Meldung übersetzen.
+  let data: any;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(
+      'Webz.io: keine JSON-Antwort erhalten. Läuft die App ohne Dev-Proxy? ' +
+      'Entweder Vite-Dev-Server verwenden (Proxy /webz-api) oder in den Einstellungen ' +
+      'eine eigene Proxy-Basis (webzApiBaseUrl) angeben, da api.webz.io keine CORS-Headers sendet.'
+    );
+  }
+  if (typeof data === 'string' && /unknown api token/i.test(data)) {
+    throw new Error('Webz.io: ungültiges API-Token. Token im Dashboard (https://app.webz.io/) kontrollieren.');
+  }
+  return data;
+}
+
+function toQueryParams(params: Record<string, string | number | boolean>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && String(v) !== '') out[k] = String(v);
+  }
+  return out;
+}
+
+// Webz.io News Search Tool — keyword search over the global news corpus.
+toolRegistry.register({
+  id: 'webz_news',
+  name: 'Webz.io News Search',
+  description:
+    'News-Recherche über die Webz.io-API (api.webz.io/search): globale Nachrichtenseiten inkl. ' +
+    'deutscher Quellen, mit Kategorie-, Sprach- und Datumsfiltern. Liefert Titel, Quelle, '
+    + 'URL, Beschreibung/Volltextauszug und Datum. Bevorzugt bei aktuellen Nachrichten, ' +
+    'Marktentwicklungen und Themenbeobachtung. Benötigt das Webz.io-API-Token aus den Einstellungen.',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Suchbegriff / Thema (z. B. "Bayer", "Inflation USA")' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 5, max 10)' },
+      hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 168 = 7 Tage)' },
+      language: { type: 'string', description: 'Sprachfilter ISO-Code, z. B. "de" oder "en"' },
+      category: {
+        type: 'string',
+        enum: ['business', 'tech', 'entertainment', 'politics', 'health', 'science', 'sports'],
+        description: 'Optionale News-Kategorie',
+      },
+      includeContent: { type: 'boolean', description: 'Auch Artikel-Volltext (gekürzt) zurückgeben' },
+    },
+    required: ['query'],
+  },
+  outputSchema: {
+    type: 'object',
+    properties: {
+      articles: { type: 'array' },
+      totalHits: { type: 'number' },
+    },
+  },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network'],
+  maxDuration: 15000,
+  maxDataSize: 50000,
+  builtin: true,
+}, async (args) => {
+  // Token sparen: Ergebnisse werden als Prompt-Tokens bei jedem Agent-Schritt
+  // erneut mitgesendet; kleine Defaults senken die Kosten ohne Qualitätsverlust.
+  const size = Math.min(Math.max(Number(args.maxResults) || 5, 1), 10);
+  const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 168, 1), 24 * 30);
+
+  const data = await fetchWebzJson({
+    query: String(args.query).trim(),
+    size,
+    dateFilter: webzDateFilter(hoursBack),
+    language: args.language,
+    category: args.category,
+    userFields: args.includeContent ? 'content,title,url,date,description' : '',
+  });
+
+  const hits: any[] = Array.isArray(data?.hits) ? data.hits : [];
+  const articles = dedupeByUrl(hits.map(mapWebzHit)).slice(0, size);
+
+  return {
+    query: args.query,
+    provider: 'webz.io',
+    totalHits: typeof data?.total === 'number' ? data.total : hits.length,
+    tookMs: data?.took,
+    hoursBack,
+    articles,
+    ...(articles.length === 0
+      ? { note: 'Keine Treffer. Query umformulieren, groesseres Zeitfenster (hoursBack) oder language/category lockern.' }
+      : {}),
+  };
+});
+
+// Webz.io Top News Tool — trending headlines per category (no query needed).
+toolRegistry.register({
+  id: 'webz_top_news',
+  name: 'Webz.io Top News',
+  description:
+    'Top-/Überschriften-Überblick aus dem Webz.io-Korpus ohne Suchbegriff: die wichtigsten ' +
+    'aktuellen Meldungen pro Kategorie (z. B. business, tech, politics), optional nach Sprache. ' +
+    'Ideal für Tagesübersichten wie "Was sind heute die wichtigsten Wirtschaftsnachrichten?".',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      category: {
+        type: 'string',
+        enum: ['business', 'tech', 'entertainment', 'politics', 'health', 'science', 'sports'],
+        description: 'News-Kategorie (Standard: business)',
+      },
+      language: { type: 'string', description: 'Sprachfilter ISO-Code, z. B. "de" oder "en"' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 5, max 10)' },
+      hoursBack: { type: 'number', description: 'Zeitfenster in Stunden (Standard 24)' },
+    },
+    required: [],
+  },
+  outputSchema: {
+    type: 'object',
+    properties: { articles: { type: 'array' } },
+  },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network'],
+  maxDuration: 15000,
+  maxDataSize: 50000,
+  builtin: true,
+}, async (args) => {
+  const size = Math.min(Math.max(Number(args.maxResults) || 5, 1), 10);
+  const hoursBack = Math.min(Math.max(Number(args.hoursBack) || 24, 1), 24 * 30);
+
+  const data = await fetchWebzJson({
+    query: '',
+    size,
+    dateFilter: webzDateFilter(hoursBack),
+    category: args.category || 'business',
+    language: args.language,
+    orderBy: 'date',
+  });
+
+  const hits: any[] = Array.isArray(data?.hits) ? data.hits : [];
+  const articles = dedupeByUrl(hits.map(mapWebzHit)).slice(0, size);
+
+  return {
+    provider: 'webz.io',
+    category: args.category || 'business',
+    language: args.language || 'any',
+    hoursBack,
+    totalHits: typeof data?.total === 'number' ? data.total : hits.length,
+    articles,
+    ...(articles.length === 0 ? { note: 'Keine Treffer in diesem Fenster — hoursBack erhoehen oder language/category lockern.' } : {}),
   };
 });
 
