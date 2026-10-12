@@ -1,6 +1,8 @@
-import type { ScheduledJob } from '../types';
+import type { ScheduledJob, ScheduledRun } from '../types';
 import {
-  getScheduledJobs, saveScheduledJob, addScheduledRun, getWorkflow, addLog,
+  db,
+  getScheduledJobs, getScheduledJob, getScheduledRuns, saveScheduledJob,
+  deleteScheduledJob, addScheduledRun, getWorkflow, addLog,
 } from './database';
 import { workflowEngine } from './workflow';
 import { setExecutionOrigin } from './tools';
@@ -75,7 +77,7 @@ class SchedulerService {
    * scheduled runs.
    */
   async runJob(jobId: string, opts: { manual?: boolean } = {}): Promise<{ success: boolean; error?: string; output?: any }> {
-    const job = await getScheduledJobs().then(jobs => jobs.find(j => j.id === jobId));
+    const job = await getScheduledJob(jobId);
     if (!job) return { success: false, error: `Job nicht gefunden: ${jobId}` };
     if (this.running.has(jobId)) return { success: false, error: 'Job läuft bereits.' };
     this.running.add(jobId);
@@ -165,6 +167,123 @@ class SchedulerService {
       await this.runJob(job.id);
     }
     return due.length;
+  }
+
+  // ============ Job management API (used by UI & schedule_* tools) ==========
+
+  /** All jobs, newest first — convenience accessor so pages don't re-sort. */
+  async listJobs(): Promise<ScheduledJob[]> {
+    const jobs = await getScheduledJobs();
+    return jobs.sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * Create a job. Validates the schedule spec up front (invalid specs would
+   * otherwise silently never fire in tick()) and anchors nextRun so the first
+   * execution happens one full interval after creation — not immediately.
+   */
+  async createJob(input: {
+    name: string;
+    schedule: string;
+    workflowId?: string;
+    inputs?: Record<string, any>;
+    enabled?: boolean;
+  }): Promise<ScheduledJob> {
+    const name = String(input.name || '').trim();
+    if (!name) throw new Error('Job-Name darf nicht leer sein.');
+    const interval = parseSchedule(input.schedule);
+    if (interval == null) {
+      throw new Error(`Ungültiger Zeitplan: "${input.schedule}". Erlaubt: @hourly, @daily, @weekly oder <n>m|h|d (z. B. 30m, 6h, 2d).`);
+    }
+    if (input.workflowId) {
+      const wf = await getWorkflow(input.workflowId);
+      if (!wf) throw new Error(`Workflow nicht gefunden: ${input.workflowId}`);
+    }
+    const now = Date.now();
+    const job: ScheduledJob = {
+      id: crypto.randomUUID(),
+      name,
+      schedule: String(input.schedule).trim().toLowerCase(),
+      workflowId: input.workflowId,
+      inputs: input.inputs,
+      enabled: input.enabled ?? true,
+      consecutiveFailures: 0,
+      nextRun: now + interval,
+      createdAt: now,
+    };
+    await saveScheduledJob(job);
+    await addLog({ level: 'info', message: `Scheduler-Job erstellt: ${job.name} (${describeSchedule(job.schedule)})`, timestamp: now });
+    return job;
+  }
+
+  /**
+   * Partial update. A changed schedule or (re-)enabling re-anchors nextRun —
+   * otherwise an edit made shortly before the old due-time would fire the job
+   * right away under the new cadence.
+   */
+  async updateJob(jobId: string, patch: Partial<Pick<ScheduledJob, 'name' | 'schedule' | 'workflowId' | 'inputs' | 'enabled'>>): Promise<ScheduledJob> {
+    const job = await getScheduledJob(jobId);
+    if (!job) throw new Error(`Job nicht gefunden: ${jobId}`);
+    const updated: ScheduledJob = { ...job };
+    if (patch.name != null) {
+      const name = String(patch.name).trim();
+      if (!name) throw new Error('Job-Name darf nicht leer sein.');
+      updated.name = name;
+    }
+    let reschedule = false;
+    if (patch.schedule != null && patch.schedule !== job.schedule) {
+      const interval = parseSchedule(patch.schedule);
+      if (interval == null) throw new Error(`Ungültiger Zeitplan: "${patch.schedule}".`);
+      updated.schedule = String(patch.schedule).trim().toLowerCase();
+      reschedule = true;
+    }
+    if (patch.workflowId != null && patch.workflowId !== job.workflowId) {
+      if (patch.workflowId) {
+        const wf = await getWorkflow(patch.workflowId);
+        if (!wf) throw new Error(`Workflow nicht gefunden: ${patch.workflowId}`);
+      }
+      updated.workflowId = patch.workflowId;
+    }
+    if (patch.inputs !== undefined) updated.inputs = patch.inputs;
+    if (patch.enabled != null && patch.enabled !== job.enabled) {
+      updated.enabled = patch.enabled;
+      if (patch.enabled) {
+        updated.consecutiveFailures = 0; // manual re-enable = fresh start
+        reschedule = true;
+      }
+    }
+    if (reschedule && updated.enabled) {
+      const interval = parseSchedule(updated.schedule) ?? 86400_000;
+      updated.nextRun = Date.now() + interval;
+    }
+    await saveScheduledJob(updated);
+    return updated;
+  }
+
+  /** Enable/disable shortcut (UI toggle). Re-enable resets the failure counter. */
+  async setEnabled(jobId: string, enabled: boolean): Promise<ScheduledJob> {
+    return this.updateJob(jobId, { enabled });
+  }
+
+  /** Delete a job together with its run history (no orphaned runs in Dexie). */
+  async removeJob(jobId: string): Promise<boolean> {
+    const job = await getScheduledJob(jobId);
+    if (!job) return false;
+    await deleteScheduledJob(jobId);
+    const runs = await db.scheduledRuns.where('jobId').equals(jobId).toArray();
+    if (runs.length) await db.scheduledRuns.bulkDelete(runs.map(r => r.id));
+    await addLog({ level: 'info', message: `Scheduler-Job gelöscht: ${job.name}`, timestamp: Date.now() });
+    return true;
+  }
+
+  /** „Jetzt testen“ from the UI — runs immediately, counted as user-initiated. */
+  async runNow(jobId: string): Promise<{ success: boolean; error?: string; output?: any }> {
+    return this.runJob(jobId, { manual: true });
+  }
+
+  /** Run history of one job (oldest first), for the UI's protocol view. */
+  async getHistory(jobId: string, limit = 20): Promise<ScheduledRun[]> {
+    return getScheduledRuns(jobId, limit);
   }
 }
 
