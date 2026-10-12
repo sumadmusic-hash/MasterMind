@@ -57,7 +57,9 @@ class ToolRegistry {
   }
 
   getTool(id: string): ToolDefinition | undefined {
-    return this.tools.get(id);
+    // Resolve near-miss ids (e.g. legacy "weather" -> "weather_lookup") the same
+    // way execute() does, so lookups don't fail on renamed/typo'd tool ids.
+    return this.tools.get(this.resolveToolId(id));
   }
 
   getEnabledTools(): ToolDefinition[] {
@@ -1527,8 +1529,8 @@ toolRegistry.register({
     const closes = rows.map((r: any) => r.close as number);
     const first = closes[0], last = closes[closes.length - 1];
     const rets = closes.slice(1).map((c: number, i: number) => Math.log(c / closes[i]));
-    const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
-    const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / Math.max(rets.length - 1, 1);
+    const mean = rets.reduce((a: number, b: number) => a + b, 0) / rets.length;
+    const variance = rets.reduce((a: number, b: number) => a + (b - mean) ** 2, 0) / Math.max(rets.length - 1, 1);
     const perYear = interval === '1d' ? 252 : interval === '1wk' ? 52 : 12;
     let peak = closes[0], maxDrawdown = 0;
     for (const c of closes) { peak = Math.max(peak, c); maxDrawdown = Math.min(maxDrawdown, (c - peak) / peak); }
@@ -1550,8 +1552,8 @@ toolRegistry.register({
         periodLow: round2(Math.min(...rows.map((r: any) => r.low ?? r.close))),
         volatilityAnnualizedPercent: round2(Math.sqrt(variance * perYear) * 100),
         maxDrawdownPercent: round2(maxDrawdown * 100),
-        avgVolume: volumes.length ? Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length) : undefined,
-        movingAverage: round2(closes.slice(-smaWindow).reduce((a, b) => a + b, 0) / smaWindow),
+        avgVolume: volumes.length ? Math.round(volumes.reduce((a: number, b: number) => a + b, 0) / volumes.length) : undefined,
+        movingAverage: round2(closes.slice(-smaWindow).reduce((a: number, b: number) => a + b, 0) / smaWindow),
         movingAverageWindow: smaWindow,
       },
       candles: rows.slice(-40),
@@ -1898,9 +1900,9 @@ export function extractArticle(
       const data = JSON.parse(script.textContent || '');
       const nodes = Array.isArray(data) ? data : [data];
       for (const node of nodes) {
-        const items = [node, ...(Array.isArray(node?.mainEntity) ? node.mainEntity : []), ...(Array.isArray(node?.@graph) ? node['@graph'] : [])];
+        const items = [node, ...(Array.isArray(node?.mainEntity) ? node.mainEntity : []), ...(Array.isArray(node?.['@graph']) ? node['@graph'] : [])];
         for (const item of items) {
-          const type = String(item?.@type || '');
+          const type = String(item?.['@type'] || '');
           if (!/NewsArticle|Article|BlogPosting|ReportageArticle/i.test(type)) continue;
           if (!out.publishedAt && item.datePublished && !Number.isNaN(Date.parse(item.datePublished))) {
             out.publishedAt = new Date(item.datePublished).toISOString();
