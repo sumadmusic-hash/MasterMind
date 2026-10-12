@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useApp } from '../store/AppContext';
-import { testConnection, getAllModels } from '../services/provider';
+import { testConnection } from '../services/provider';
 import { clearAllData } from '../services/database';
 import { tpmManager } from '../services/tpm';
 import {
@@ -21,7 +21,6 @@ export function SettingsPage() {
 
   if (!settings) return null;
 
-  const allModels = getAllModels();
 
   const handleTestConnection = async (provider: string) => {
     setTestingProvider(provider);
@@ -159,7 +158,7 @@ export function SettingsPage() {
               label="Primary Model"
               config={settings.primaryModel}
               onChange={(config) => updateSettings({ primaryModel: config })}
-              models={allModels}
+
             />
 
             {/* Fallback 1 */}
@@ -167,7 +166,7 @@ export function SettingsPage() {
               label="Fallback 1"
               config={settings.fallback1}
               onChange={(config) => updateSettings({ fallback1: config })}
-              models={allModels}
+
               optional
             />
 
@@ -176,7 +175,7 @@ export function SettingsPage() {
               label="Fallback 2"
               config={settings.fallback2}
               onChange={(config) => updateSettings({ fallback2: config })}
-              models={allModels}
+
               optional
             />
           </div>
@@ -304,11 +303,10 @@ export function SettingsPage() {
   );
 }
 
-function ModelSelector({ label, config, onChange, models, optional }: {
+function ModelSelector({ label, config, onChange, optional }: {
   label: string;
   config?: { provider: string; modelId: string };
   onChange: (config: any) => void;
-  models: Record<string, { id: string; name: string }[]>;
   optional?: boolean;
 }) {
   const [enabled, setEnabled] = useState(!!config);
@@ -347,23 +345,21 @@ function ModelSelector({ label, config, onChange, models, optional }: {
           value={config?.provider || 'groq'}
           onChange={e => {
             const provider = e.target.value;
-            const defaultModel = models[provider]?.[0]?.id || '';
-            onChange({ provider, modelId: defaultModel });
+            // Modell-ID nicht überschreiben – der Nutzer trägt sie selbst ein.
+            onChange({ ...config, provider });
           }}
           className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
         >
           <option value="groq">Groq</option>
           <option value="openrouter">OpenRouter</option>
         </select>
-        <select
+        <input
+          type="text"
           value={config?.modelId || ''}
           onChange={e => onChange({ ...config, modelId: e.target.value })}
+          placeholder={config?.provider === 'openrouter' ? 'z. B. openai/gpt-4o-mini' : 'z. B. llama-3.3-70b-versatile'}
           className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
-        >
-          {(models[config?.provider || 'groq'] || []).map(m => (
-            <option key={m.id} value={m.id}>{m.name}</option>
-          ))}
-        </select>
+        />
       </div>
     </div>
   );
