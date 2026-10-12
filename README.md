@@ -10,6 +10,9 @@ A modular, extensible AI-powered research web application with chat, tool orches
 - **Automatic Fallback**: Intelligent failover between models on errors, rate limits, server issues — or content refusals (detected in English and German replies; the fallback model takes over the same conversation with its full working state)
 - **Resume Interrupted Turns („Fortsetzen")**: If a turn is interrupted (all models refused, or an infrastructure error occurred mid-task), completed steps, tool calls and tool results are persisted; the „Fortsetzen" button continues exactly where the run stopped instead of restarting it
 - **Token Budget Management (TPM)**: Server-side token-per-minute control with reservation system for parallel requests
+- **Token-Efficient Prompting**: Compressed system prompt (rules only, no tool list — schemas are sent via the API `tools` parameter), strict output caps (≤300 words, ≤3 tool calls per turn) and a fixed response template to keep answer quality while cutting prompt/completion tokens
+- **Context Window Guard**: History is truncated to the newest messages that fit a 24k-token prompt budget; stale tool results from earlier turns are dropped, current-turn tool results are never lost
+- **Compact Tool Outputs**: Tool results fed back to the model are compacted (strings capped at 200 chars, arrays at 8 items, URLs preserved for citations); duplicate tool calls within a turn return a cached-skip note instead of re-executing
 - **Tool Registry**: Modular tools with validation, permissions, timeouts, and data limits
 - **Workflow Builder**: Visual drag-and-drop editor (React Flow) for creating reusable research workflows
 - **AI Tool Generation**: Describe workflows in natural language, AI generates the structure
@@ -106,6 +109,21 @@ Each slot can independently select provider and model.
 - **Max Tokens per Request**: Maximum output tokens per single call
 - **Max Tool Steps**: Maximum tool invocations per user request
 - Budget is shared across all chats, parallel requests, and workflow executions
+
+### Reducing Token Consumption (app-side levers)
+The app already implements the main cost levers — no quality regression, since citations, fact/analysis separation and the fixed response template are preserved:
+
+| Measure | Where | Effect |
+|---------|-------|--------|
+| Compressed system prompt (rules only; tool list removed because schemas go via the API `tools` parameter) | `src/services/chat.ts` → `SYSTEM_PROMPT` | −30–50 % prompt tokens |
+| Hard caps per turn: ≤300 words output, ≤3 tool calls, forced answer template | `SYSTEM_PROMPT` sections 1 & 4 | −20 % completion tokens |
+| History truncation to a 24k-token prompt budget + dropping stale tool messages from earlier turns | `ChatOrchestrator.buildProviderMessages` / `fitToContextWindow` | −15–40 % in long sessions |
+| Tool-output compaction before results re-enter the prompt (200-char strings, 8-item arrays, URLs kept intact) | `src/services/tools.ts` → `compactToolData` | −25 % tool-result tokens |
+| Duplicate tool-call dedup within a turn (cached-skip note instead of re-execution) | agent loop (`seenToolSignatures`) | avoids repeated search/fetch tokens |
+| Per-tool parameter limits enforced via the prompt (`maxResults: 3`, `url_fetch maxLength: 2000` + article selector, `text_summarize maxLength: 80`) | `SYSTEM_PROMPT` section 2 | bounds raw data in context |
+| Streaming + early stop on TPM-budget pressure (wait-or-stop with status feedback) | `src/services/tpm.ts`, `provider.ts` (`onBudgetWait`) | prevents over-limit spend |
+
+Further optional reductions: lower the tool defaults in `src/services/tools.ts` (e.g. `web_search.maxResults` 10→2, `url_fetch.maxLength` 6000→1500, `text_summarize.maxLength` 100→60) — each roughly halves that tool's contribution; embedding-based retrieval instead of full-text search would cut the largest share but requires new infrastructure. When tightening limits, validate against a golden-set evaluation to catch quality regressions, and consider collapsible "Details" in the UI so shorter answers still feel complete.
 
 ## Usage
 
