@@ -32,9 +32,10 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 - \`url_fetch\`: \`maxLength: 2000\` + \`selector: "article, main, .content, #article-body"\`; nur wenn Snippet unzureichend
 - \`text_summarize\` (\`maxLength: 80\`) nur bei Fetch-Text > 1500 Zeichen; \`data_filter\` nur bei Rohdaten aus anderen Tools
 - \`stock_analysis\` (\`period: "6mo"\`, \`interval: "1d"\`) statt \`stock_price\`; \`company_lookup\` mit \`includeFundamentals: true\`
+- **Aktuelle Kurse/Indizes** (z. B. „DAX kurs?“): \`stock_price\` mit \`ticker: "DAX"\` (auch MDAX, SDAX, TecDAX, DivDAX, ^GSPC, Bitcoin — Namen werden automatisch aufgelöst); \`web_search\` nur als Fallback, wenn das Tool keine Kursdaten liefert
 - \`calculator\`/\`currency_convert\` für jede Berechnung — kein Kopfrechnen
 - \`generate_report\`: max 4 Sektionen à 60 Wörter
-- **Verboten:** \`stock_price\` (Tagesdaten), \`web_search\` mit \`maxResults > 5\`, \`url_fetch\` ohne \`maxLength\`/\`selector\`
+- **Verboten:** \`stock_price\` für Research-Berichte (nur Tagesdaten; für Einzelabfragen aktueller Kurse/Indizes ist \`stock_price\` dagegen das richtige Tool), \`web_search\` mit \`maxResults > 5\`, \`url_fetch\` ohne \`maxLength\`/\`selector\`
 
 ## 3. WORKFLOW (für Research-Aufgaben; Schritte 2 und 4 nur wenn nötig)
 1. **SEARCH** → \`web_search\`/\`news_search\` (max 3 Ergebnisse; bereits dedupliziert nach URL und auf 5 begrenzt — \`data_filter\` danach ist überflüssig)
