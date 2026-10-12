@@ -1138,6 +1138,208 @@ toolRegistry.register({
   };
 });
 
+// ============ GNews.io News API (https://gnews.io/) ============
+//
+// Rechercheergebnis "beste kostenlose News-API" (Stand: Okt. 2026):
+// - gnews.io ist die einzige strukturierte JSON-News-Suche, die man OHNE jegliche
+//   Registrierung nutzen kann: der offizielle Demo-Key "demo" ist dauerhaft frei
+//   und liefert echte Treffer (max. 10 Artikel/Tag, q/m/max/lang/top-headlines).
+// - Mit kostenlosem Account (100 Req/Tag) wird aus dem Demo-Modus voller Zugriff.
+// - Alternativen im Blick behalten:
+//     * The Guardian Open Platform — wirklich open source (Apache-2.0 auf GitHub),
+//       kostenlose API (5.000 Req/Tag, Key per E-Mail-Aktivierung).
+//     * NewsData.io / Currents / GDELT — Free-Tier mit API-Key bzw. ganz ohne Key.
+//     * Webz.io (hier als webz_news integriert) — 1 Mio. Seiten kostenlos.
+// - Endpunkte:
+//     GET https://gnews.io/api/v4/search?q=<query>&lang=de&max=3&apikey=<KEY>
+//     GET https://gnews.io/api/v4/top-headlines?category=business&lang=de&max=3&apikey=<KEY>
+//   Antwort: { totalArticles, articles: [{ title, description, url, image, pubDate }] }
+//   Fehler: HTTP 4xx/5xx + {"errors":["..."]} (z. B. invalid key, quota exceeded).
+// - CORS: api.gnews.io sendet keine Access-Control-Allow-Origin-Headers; direkte
+//   Browser-Fetches werden blockiert. Lösung wie bei Webz.io:
+//     * Dev: Vite-Proxy /gnews-api → https://gnews.io (siehe vite.config.js)
+//     * Prod: eigene Proxy-Basis in den Settings (gnewsApiBaseUrl)
+//     * Fallback: öffentliche JSON-CORS-Proxies (allorigins.win, corsproxy.io)
+
+const GNEWS_DEMO_KEY = 'demo'; // offizieller, dauerhaft freier Demo-Key von gnews.io
+
+/** Basis-URL für GNews-Aufrufe: Dev-Proxy, konfigurierbare Proxy-Basis oder direkt. */
+async function getGnewsBaseUrl(): Promise<string> {
+  try {
+    const settings = await getSettings();
+    const custom = String(settings?.gnewsApiBaseUrl || '').trim().replace(/\/+$/, '');
+    if (custom) return custom;
+  } catch { /* IndexedDB nicht verfügbar (Tests) → Default-Proxy */ }
+  // /gnews-api ist im Vite-Dev-Server als Rewrite-Proxy auf https://gnews.io definiert.
+  return '/gnews-api';
+}
+
+/** Holt eine GNews-API-Antwort über alle verfügbaren CORS-Pfade (Proxy-Kaskade). */
+async function fetchGnewsJson(endpoint: string, params: Record<string, any>): Promise<any> {
+  const settings = await getSettings().catch(() => null);
+  const key = String(settings?.gnewsApiKey || '').trim() || GNEWS_DEMO_KEY;
+  const qs = new URLSearchParams({ ...params, apikey: key });
+  const base = await getGnewsBaseUrl();
+  const target = `${base}/api/v4/${endpoint}?${qs}`;
+
+  // Reihenfolge: erst eigener Pfad (Dev-Proxy/Proxy-Basis), dann öffentliche Proxies.
+  const candidates = [
+    target,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(target)}`,
+  ];
+
+  const errors: string[] = [];
+  for (const url of candidates) {
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(8000), credentials: 'omit' });
+      if (!resp.ok) { errors.push(`${new URL(url, 'http://local').host}: HTTP ${resp.status}`); continue; }
+      const text = await resp.text();
+      let data: any;
+      try { data = JSON.parse(text); }
+      catch { errors.push('Antwort ist kein JSON (Proxy blockiert?)'); continue; }
+      // GNews meldet Fehler als { errors: [...] } — als Fehler behandeln, damit
+      // der nächste Proxy-Kandidat bzw. der Hinweis an das Modell durchgreift.
+      if (Array.isArray(data?.errors) && data.errors.length > 0) {
+        throw new Error(`GNews: ${data.errors.join('; ')}`);
+      }
+      if (!Array.isArray(data?.articles)) {
+        errors.push('Unerwartetes Antwortformat (kein articles-Feld)');
+        continue;
+      }
+      return data;
+    } catch (err: any) {
+      // HTTP-Fehler der Proxies → weiter zur nächsten Option; echte API-Fehler
+      // (errors-Feld oben) werden sofort geworfen.
+      if (String(err?.message || '').startsWith('GNews:')) throw err;
+      errors.push(`${err.message}`);
+    }
+  }
+  if (key === GNEWS_DEMO_KEY) {
+    // Demo-Key erschöpft/abgelehnt — Nutzer zum kostenlosen Key verleiten.
+    throw new Error(
+      'GNews: Demo-Key lieferte keine Daten (Limit von 10 Anfragen/Tag erreicht?). ' +
+      'Bitte unter Einstellungen → API Keys einen kostenlosen GNews-API-Key hinterlegen (https://gnews.io).'
+    );
+  }
+  throw new Error(`GNews: Alle Zugriffswege fehlgeschlagen (${errors.join('; ')})`);
+}
+
+/** Mappt einen GNews-Artikel auf das gemeinsame Source-Schema der App. */
+function mapGnewsHit(a: any): any {
+  const publishedAt = a.pubDate ? new Date(a.pubDate).toISOString() : undefined;
+  return {
+    title: String(a.title || '').trim(),
+    url: cleanUrl(String(a.url || '')),
+    snippet: stripHtml(String(a.description || '')).slice(0, 300),
+    source: (() => { try { return new URL(a.url).hostname.replace(/^www\./, ''); } catch { return 'gnews.io'; } })(),
+    publishedAt,
+    provider: 'gnews.io',
+  };
+}
+
+// GNews Search Tool — kostenlose, schlüssellose JSON-News-Suche (Demo-Key).
+toolRegistry.register({
+  id: 'gnews_search',
+  name: 'GNews Search',
+  description:
+    'Aktuelle Nachrichten über die GNews.io-API (json, ohne Registrierung via Demo-Key nutzbar; ' +
+    'mit kostenlosem API-Key 100 Abfragen/Tag). Sucht in internationalen Quellen inkl. deutscher ' +
+    'Presse und liefert Titel, Quelle, Snippet und Zeitstempel. Tier-1-Werkzeug für News-Fragen; ' +
+    'bei Demo-Limit-Fehler auf news_search (RSS) oder webz_news ausweichen.',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Suchbegriff (in Sprache des lang-Filters)' },
+      language: { type: 'string', description: 'ISO-Code, z. B. "de" (Standard) oder "en"' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 3, max 10)' },
+    },
+    required: ['query'],
+  },
+  outputSchema: {
+    type: 'object',
+    properties: { articles: { type: 'array' } },
+  },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network'],
+  maxDuration: 15000,
+  maxDataSize: 50000,
+  builtin: true,
+}, async (args) => {
+  // Token sparen: kleine Defaults; GNews zählt zudem pro Anfrage (Demo: 10/Tag).
+  const max = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
+  const data = await fetchGnewsJson('search', {
+    q: args.query,
+    lang: args.language || 'de',
+    max,
+  });
+
+  const articles = dedupeByUrl((data.articles || []).map(mapGnewsHit)).filter(a => a.title && a.url).slice(0, max);
+
+  return {
+    provider: 'gnews.io',
+    query: args.query,
+    language: args.language || 'de',
+    totalHits: typeof data.totalArticles === 'number' ? data.totalArticles : articles.length,
+    articles,
+    ...(articles.length === 0 ? { note: 'Keine Treffer — query/language lockern oder news_search verwenden.' } : {}),
+  };
+});
+
+// GNews Top Headlines Tool — Schlagzeilen pro Kategorie, ohne Suchbegriff.
+toolRegistry.register({
+  id: 'gnews_top_headlines',
+  name: 'GNews Top Headlines',
+  description:
+    'Die wichtigsten aktuellen Schlagzeilen einer GNews-Kategorie (general, business, technology, ' +
+    'entertainment, sports, science, health) — ohne Suchbegriff, ideal für Tagesübersichten. ' +
+    'Kostenlos via Demo-Key; Tier-1-Werkzeug (Antwort direkt aus den Snippets).',
+  category: 'data_source',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      category: {
+        type: 'string',
+        enum: ['general', 'business', 'technology', 'entertainment', 'sports', 'science', 'health'],
+        description: 'News-Kategorie (Standard: general)',
+      },
+      language: { type: 'string', description: 'ISO-Code, z. B. "de" (Standard) oder "en"' },
+      maxResults: { type: 'number', description: 'Maximale Treffer (Standard 3, max 10)' },
+    },
+    required: [],
+  },
+  outputSchema: {
+    type: 'object',
+    properties: { articles: { type: 'array' } },
+  },
+  version: '1.0.0',
+  enabled: true,
+  permissions: ['network'],
+  maxDuration: 15000,
+  maxDataSize: 50000,
+  builtin: true,
+}, async (args) => {
+  const max = Math.min(Math.max(Number(args.maxResults) || 3, 1), 10);
+  const data = await fetchGnewsJson('top-headlines', {
+    category: args.category || 'general',
+    lang: args.language || 'de',
+    max,
+  });
+
+  const articles = dedupeByUrl((data.articles || []).map(mapGnewsHit)).filter(a => a.title && a.url).slice(0, max);
+
+  return {
+    provider: 'gnews.io',
+    category: args.category || 'general',
+    language: args.language || 'de',
+    totalHits: typeof data.totalArticles === 'number' ? data.totalArticles : articles.length,
+    articles,
+    ...(articles.length === 0 ? { note: 'Keine Treffer — category/language wechseln oder gnews_search nutzen.' } : {}),
+  };
+});
+
 // Weather Tool
 toolRegistry.register({
   id: 'weather_lookup',

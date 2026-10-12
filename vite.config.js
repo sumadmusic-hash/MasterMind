@@ -54,6 +54,17 @@ export default defineConfig({
         secure: true,
         rewrite: (path) => path.replace(/^\/webz-api/, ''),
       },
+      // GNews.io News API (https://gnews.io/): api.gnews.io sendet keine
+      // CORS-Headers, daher laufen die Browser-Fetches der gnews_*-Tools
+      // über diesen Dev-Proxy (/gnews-api/api/v4/... → https://gnews.io/api/v4/...).
+      // In Produktion durch eine eigene Proxy-Basis in den Settings
+      // (gnewsApiBaseUrl) ersetzen.
+      '/gnews-api': {
+        target: 'https://gnews.io',
+        changeOrigin: true,
+        secure: true,
+        rewrite: (path) => path.replace(/^\/gnews-api/, ''),
+      },
     },
   },
 });
