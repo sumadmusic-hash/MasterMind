@@ -370,8 +370,8 @@ describe('ToolRegistry', () => {
       let postedBody = '';
       (globalThis as any).fetch = async (url: any, init?: any) => {
         urls.push(String(url));
-        if (String(url).includes('html.duckduckgo.com')) {
-          postedBody = String(init?.body || '');
+        if (String(url).includes('duckduckgo.com')) {
+          if (String(init?.method || 'GET').toUpperCase() === 'POST') postedBody = String(init?.body || '');
           return new Response(SAMPLE_HTML, { status: 200, headers: { 'content-type': 'text/html' } });
         }
         return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
@@ -387,10 +387,48 @@ describe('ToolRegistry', () => {
       expect(data.results[0].snippet).toBe('Snippet-Text mit "HTML"');
       expect(data.results[0].provider).toBe('duckduckgo-web');
       expect(data.results[1].url).toBe('https://zwei.de/'); // protocol-relative uddg
-      // POST an html.duckduckgo.com mit Region aus language="de"
-      expect(urls.some(u => u.includes('html.duckduckgo.com/html/'))).toBe(true);
-      expect(postedBody).toContain('q=beispiel+suche');
-      expect(postedBody).toContain('kl=de-de');
+      // Region aus language="de" landet in der Anfrage (Proxy-GET und/oder Direkt-POST)
+      expect(urls.some(u => u.includes('/ddg-api/') || u.includes('html.duckduckgo.com'))).toBe(true);
+      expect((urls.find(u => u.includes('kl=de-de')) || postedBody)).toContain('kl=de-de');
+    });
+
+    it('CORS-Regression: browser-seitiger "Failed to fetch" wird abgefangen und fuehrt zu klarem Fehlerbild', async () => {
+      // html.duckduckgo.com sendet keine CORS-Headers -> im Browser wirft fetch
+      // einen TypeError "Failed to fetch". Das Tool darf nicht craschen, sondern
+      // muss den Grund nennen und auf die Instant-Answer-API zurueckfallen.
+      (globalThis as any).fetch = async (url: any) => {
+        if (String(url).includes('html.duckduckgo.com') || String(url).includes('/ddg-api')) {
+          throw new TypeError('Failed to fetch');
+        }
+        return new Response(JSON.stringify({
+          Heading: 'Bundeskanzler',
+          Abstract: 'Amtierender Bundeskanzler ist Friedrich Merz (CDU), seit Mai 2025.',
+          AbstractURL: 'https://de.wikipedia.org/wiki/Bundeskanzler_(Deutschland)',
+          RelatedTopics: [],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      };
+      const result = await execDDG({ query: 'wer ist bundeskanzler', language: 'de' });
+      expect(result.success).toBe(true);
+      const data = result.data as any;
+      expect(data.results.length).toBeGreaterThan(0);
+      expect(data.results[0].snippet).toContain('Merz');
+      expect(data.partialErrors?.[0]).toContain('duckduckgo-web');
+      expect(data.partialErrors?.[0]).toContain('Failed to fetch');
+    });
+
+    it('sucht zuerst ueber den /ddg-api-Proxy-Pfad (CORS-frei), nicht direkt bei DDG', async () => {
+      const urls: string[] = [];
+      (globalThis as any).fetch = async (url: any, init?: any) => {
+        urls.push(`${String(init?.method || 'GET')} ${String(url)}`);
+        if (String(url).startsWith('/ddg-api')) {
+          return new Response(SAMPLE_HTML, { status: 200, headers: { 'content-type': 'text/html' } });
+        }
+        return new Response('{}', { status: 200 });
+      };
+      await execDDG({ query: 'test', language: 'de' });
+      expect(urls[0]).toMatch(/^GET \/ddg-api\/\?q=test&kl=de-de$/);
+      // Proxy erfolgreich -> kein zweiter (Direkt-) Versuch noetig.
+      expect(urls.filter(u => u.includes('html.duckduckgo.com')).length).toBe(0);
     });
 
     it('timeRange/Enum-Validierung: unbekannter Wert wird abgelehnt, gueltiger akzeptiert', async () => {
