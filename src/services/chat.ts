@@ -714,14 +714,17 @@ export class ChatOrchestrator {
         // made many models re-issue the same call anyway (the dedup only
         // saved execution time, not prompt tokens). Replaying the compacted
         // result costs nothing extra and lets the model proceed immediately.
+        // Cross-step duplicates are NOT re-executed and must not linger in the
+        // message list as tool replies for calls the model may never see
+        // again: when the budget trips in this very step, the duplicate's
+        // announcement is trimmed below (Groq rejects a tool response without
+        // a preceding tool_call with a 400). Buffer the replay here and push
+        // it into `messages` only once it is clear the duplicate's tool_call
+        // stays in the conversation (see budgetExhausted branch at the end of
+        // this step).
         const signature = `${toolName}:${JSON.stringify(toolArgs)}`;
         const priorCallId = seenToolSignatures.get(signature);
         if (priorCallId !== undefined) {
-          // The producing call may still be running IN PARALLEL inside this
-          // very step (its result isn't in turnToolResults yet). Push the tool
-          // message AFTER the results loop instead, so the duplicate always
-          // gets the real cached replay — never a bare "returned earlier"
-          // hint that models tend to answer by re-issuing the same call.
           deferredDedupReplies.push({ callId, signature });
           continue;
         }
@@ -761,7 +764,11 @@ export class ChatOrchestrator {
       // build all replies first, then push in ORIGINAL call order so the
       // assistant tool_calls and tool messages stay aligned (Groq rejects
       // out-of-order tool responses with a 400).
+      // `stepToolMessagesByCall` keeps each reply addressable by its protocol
+      // id so the budget-trim at the end of this step can remove exactly the
+      // messages of dropped calls while preserving the original ordering.
       const stepToolMessages: ProviderMessage[] = [];
+      const stepToolMessagesByCall = new Map<string, ProviderMessage>();
 
       if (pendingCalls.length > 0) {
         callbacks.onStatus(
@@ -826,10 +833,21 @@ export class ChatOrchestrator {
       // step (or earlier), so its result is available by now — replay it
       // instead of a bare hint. Fallback note keeps the protocol valid even if
       // the producing call itself failed before storing a result.
+      // NOTE: match on the TOOL NAME, not the raw call id: when the provider
+      // omits `tc.id`, the loop mints synthetic ids (`call_${turnCallIndex}`)
+      // that do NOT coincide with ToolResult.callId, so an id-based lookup
+      // would silently degrade every cross-step cached replay to a bare hint
+      // (the exact failure observed with Groq: repeated identical searches
+      // received no result back and the model re-issued them until the budget
+      // was exhausted). The signature maps each duplicate to the ORIGINAL
+      // call, whose toolId survives id normalization inside execute().
       for (const dup of deferredDedupReplies) {
         const priorCallId = seenToolSignatures.get(dup.signature);
-        const priorResult = priorCallId ? turnToolResults.find(r => r.callId === priorCallId) : undefined;
-        stepToolMessages.push({
+        const priorCall = priorCallId ? turnToolCalls.find(c => c.id === priorCallId) : undefined;
+        const priorResult = priorCall
+          ? [...turnToolResults].reverse().find(r => r.toolId === priorCall.toolId)
+          : undefined;
+        const reply: ProviderMessage = {
           role: 'tool',
           content: JSON.stringify(
             priorResult
@@ -840,7 +858,9 @@ export class ChatOrchestrator {
               : { skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }
           ),
           tool_call_id: dup.callId,
-        });
+        };
+        stepToolMessages.push(reply);
+        stepToolMessagesByCall.set(dup.callId, reply);
       }
 
       messages.push(...stepToolMessages);
@@ -857,6 +877,29 @@ export class ChatOrchestrator {
       this.toolCallCount += usedBudget;
       const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
+        // Protocol invariant for the FINAL/synthesis prompt: every tool_call
+        // announced in the assistant message needs exactly one matching tool
+        // message — and no tool message may exist for a call that was never
+        // announced. When the per-turn budget tripped mid-step, calls beyond
+        // the remaining budget were answered with a "skipped" note instead of
+        // being executed; trim them out of BOTH the assistant message and the
+        // replies pushed above so the synthesis history stays valid (a stray
+        // tool response is rejected by Groq with a 400). Only the calls that
+        // actually EXECUTED keep their announcement + real result; everything
+        // else (budget-skipped notes, duplicate replays) disappears from the
+        // final prompt — the model answers from the executed results plus the
+        // nudge below.
+        const announcedIds = new Set<string>(pendingCalls.map(c => c.id));
+        assistantMsg.tool_calls = assistantMsg.tool_calls.filter((c: any) => announcedIds.has(c.id));
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const m = messages[i];
+          if (m.role !== 'tool' || !m.tool_call_id) continue;
+          if (announcedIds.has(m.tool_call_id)) continue;
+          // Drop budget-skipped notes and buffered dedup replays…
+          if (stepToolMessagesByCall.has(m.tool_call_id) || /"skipped":/.test(m.content ?? '')) {
+            messages.splice(i, 1);
+          }
+        }
         messages.push({
           role: 'user',
           content: simpleFactTurn
