@@ -2564,13 +2564,22 @@ function resolveTicker(raw: unknown): string {
  */
 async function fetchYahooChartJson(ticker: string, query: string): Promise<any> {
   const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
-  const ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+  // Yahoo's edge blocks some User-Agent strings outright (HTTP 429 on every
+  // request, e.g. the classic macOS/Chrome UA), while others pass. Rotating
+  // through several realistic UAs per host makes the retry loop actually
+  // escape the block instead of repeating the identical rejected request.
+  const userAgents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  ];
   let lastError = '';
   // Overall time budget — the tool wrapper may still hit its maxDuration, but
   // we never hang longer than this and always end with a clear error message.
   const deadline = Date.now() + 20000;
-  for (let attempt = 0; attempt < hosts.length * 2 && Date.now() < deadline; attempt++) {
+  for (let attempt = 0; attempt < hosts.length * userAgents.length && Date.now() < deadline; attempt++) {
     const host = hosts[attempt % hosts.length];
+    const ua = userAgents[Math.floor(attempt / hosts.length) % userAgents.length];
     const url = `https://${host}/v8/finance/chart/${encodeURIComponent(ticker)}?${query}`;
     try {
       const resp = await fetch(url, { headers: { 'User-Agent': ua, 'Accept': 'application/json' }, signal: AbortSignal.timeout(9000) });
