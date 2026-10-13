@@ -1454,6 +1454,40 @@ async function fetchGnewsJson(endpoint: string, params: Record<string, any>): Pr
   throw new Error(`GNews: Alle Zugriffswege fehlgeschlagen (${errors.join('; ')})`);
 }
 
+/**
+ * Last-resort fallback for crypto tickers when Yahoo is unreachable/rate-
+ * limited: CoinGecko (free, CORS-enabled, no key). Shared by company_lookup
+ * and stock_price so the ticker map and fetch logic exist exactly once.
+ * Returns null when the ticker is not a known crypto or the lookup fails.
+ */
+const CRYPTO_COINGECKO_IDS: Record<string, string> = {
+  'BTC-USD': 'bitcoin', 'ETH-USD': 'ethereum', 'SOL-USD': 'solana',
+  'XRP-USD': 'ripple', 'DOGE-USD': 'dogecoin', 'LTC-USD': 'litecoin',
+  'ADA-USD': 'cardano', 'DOT-USD': 'polkadot', 'LINK-USD': 'chainlink',
+};
+
+async function fetchCryptoPriceFromCoingecko(
+  ticker: string,
+): Promise<{ id: string; priceUsd: number; changePercent24h?: number } | null> {
+  const cgId = CRYPTO_COINGECKO_IDS[ticker.toUpperCase()];
+  if (!cgId) return null;
+  try {
+    const resp = await fetch(
+      `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`,
+      { signal: AbortSignal.timeout(7000) },
+    );
+    const d = resp.ok ? (await resp.json().catch(() => null))?.[cgId] : null;
+    if (typeof d?.usd !== 'number') return null;
+    return {
+      id: cgId,
+      priceUsd: d.usd,
+      changePercent24h: typeof d.usd_24h_change === 'number' ? d.usd_24h_change : undefined,
+    };
+  } catch {
+    return null; // caller reports the original error
+  }
+}
+
 /** Mappt einen GNews-Artikel auf das gemeinsame Source-Schema der App. */
 function mapGnewsHit(a: any): any {
   const publishedAt = a.pubDate ? new Date(a.pubDate).toISOString() : undefined;
@@ -2490,30 +2524,16 @@ async function fetchYahooFundamentals(ticker: string): Promise<any | null> {
   // D) last resort: CoinGecko for cryptos. Yahoo is intermittently rate-limited
   // (HTTP 429 + HTML body); crypto questions should still get a real price.
   if (Object.keys(out).length === 0) {
-    const CG_IDS: Record<string, string> = {
-      'BTC-USD': 'bitcoin', 'ETH-USD': 'ethereum', 'SOL-USD': 'solana',
-      'XRP-USD': 'ripple', 'DOGE-USD': 'dogecoin', 'LTC-USD': 'litecoin',
-      'ADA-USD': 'cardano', 'DOT-USD': 'polkadot', 'LINK-USD': 'chainlink',
-    };
-    const cgId = CG_IDS[ticker.toUpperCase()];
-    if (cgId) {
-      try {
-        const resp = await fetch(
-          `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`,
-          { headers, signal: AbortSignal.timeout(7000) }
-        );
-        const d = resp.ok ? (await resp.json().catch(() => null))?.[cgId] : null;
-        if (typeof d?.usd === 'number') {
-          out = {
-            longName: ticker.toUpperCase(),
-            currency: 'USD',
-            fullExchangeName: 'CoinGecko',
-            regularMarketPrice: d.usd,
-            regularMarketChangePercent: d.usd_24h_change,
-            source: 'coingecko',
-          };
-        }
-      } catch { /* give up */ }
+    const cg = await fetchCryptoPriceFromCoingecko(ticker);
+    if (cg) {
+      out = {
+        longName: ticker.toUpperCase(),
+        currency: 'USD',
+        fullExchangeName: 'CoinGecko',
+        regularMarketPrice: cg.priceUsd,
+        regularMarketChangePercent: cg.changePercent24h,
+        source: 'coingecko',
+      };
     }
   }
 
@@ -2630,6 +2650,15 @@ function resolveTicker(raw: unknown): string {
 }
 
 /**
+ * Overall time budget (ms) for the Yahoo retry cascade. MUST stay below the
+ * smallest `maxDuration` of the tools that call it (stock_price: 10 s) so the
+ * helper always finishes — with a clear error message — BEFORE the tool
+ * wrapper's hard timeout aborts it. A budget larger than maxDuration made the
+ * wrapper reject first and the caller's fallbacks (e.g. CoinGecko) never ran.
+ */
+const YAHOO_RETRY_BUDGET_MS = 9000;
+
+/**
  * Fetch a Yahoo Finance v8 chart payload as JSON.
  *
  * Fixes the "stock_price … HTML‑Fehler" bug: Yahoo answers with HTTP 429 and
@@ -2653,15 +2682,22 @@ async function fetchYahooChartJson(ticker: string, query: string): Promise<any> 
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
   ];
   let lastError = '';
-  // Overall time budget — the tool wrapper may still hit its maxDuration, but
-  // we never hang longer than this and always end with a clear error message.
-  const deadline = Date.now() + 20000;
+  // Overall time budget — kept under every caller's maxDuration (see
+  // YAHOO_RETRY_BUDGET_MS) so we never hang longer than this and always end
+  // with a clear error message instead of a generic tool timeout.
+  const deadline = Date.now() + YAHOO_RETRY_BUDGET_MS;
   for (let attempt = 0; attempt < hosts.length * userAgents.length && Date.now() < deadline; attempt++) {
     const host = hosts[attempt % hosts.length];
     const ua = userAgents[Math.floor(attempt / hosts.length) % userAgents.length];
     const url = `https://${host}/v8/finance/chart/${encodeURIComponent(ticker)}?${query}`;
     try {
-      const resp = await fetch(url, { headers: { 'User-Agent': ua, 'Accept': 'application/json' }, signal: AbortSignal.timeout(9000) });
+      // Per-request timeout bounded by the remaining overall budget, so a
+      // single slow request can never push the loop past the deadline.
+      const remaining = deadline - Date.now();
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': ua, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(Math.min(9000, Math.max(remaining, 500))),
+      });
       const ct = resp.headers.get('content-type') || '';
       if (resp.status === 429) {
         lastError = `Rate-Limit (HTTP 429) von ${host}`;
@@ -2775,30 +2811,17 @@ toolRegistry.register({
     };
     } catch (err: any) {
       // Last-resort fallback so a Yahoo rate-limit no longer means "no price":
-      // cryptos via CoinGecko (free, CORS-enabled, no key).
-      const CG_IDS: Record<string, string> = {
-        'BTC-USD': 'bitcoin', 'ETH-USD': 'ethereum', 'SOL-USD': 'solana',
-        'XRP-USD': 'ripple', 'DOGE-USD': 'dogecoin', 'LTC-USD': 'litecoin',
-        'ADA-USD': 'cardano', 'DOT-USD': 'polkadot', 'LINK-USD': 'chainlink',
-      };
-      const cgId = CG_IDS[ticker.toUpperCase()];
-      if (cgId) {
-        try {
-          const cgResp = await fetch(
-            `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd&include_24hr_change=true`,
-            { signal: AbortSignal.timeout(7000) }
-          );
-          const cg = cgResp.ok ? (await cgResp.json().catch(() => null))?.[cgId] : null;
-          if (typeof cg?.usd === 'number') {
-            return {
-              ticker, name: ticker, price: Math.round(cg.usd * 100) / 100,
-              changePercent: typeof cg.usd_24h_change === 'number' ? Math.round(cg.usd_24h_change * 100) / 100 : null,
-              currency: 'USD', exchange: 'CoinGecko', found: true,
-              source: 'coingecko (Fallback, da Yahoo nicht erreichbar war)',
-              dataNote: 'Live-Krypto-Daten von CoinGecko.',
-            };
-          }
-        } catch { /* report the original error below */ }
+      // cryptos via CoinGecko (free, CORS-enabled, no key). Shared helper keeps
+      // the ticker map identical to the one used by company_lookup.
+      const cg = await fetchCryptoPriceFromCoingecko(ticker);
+      if (cg) {
+        return {
+          ticker, name: ticker, price: Math.round(cg.priceUsd * 100) / 100,
+          changePercent: typeof cg.changePercent24h === 'number' ? Math.round(cg.changePercent24h * 100) / 100 : null,
+          currency: 'USD', exchange: 'CoinGecko', found: true,
+          source: 'coingecko (Fallback, da Yahoo nicht erreichbar war)',
+          dataNote: 'Live-Krypto-Daten von CoinGecko.',
+        };
       }
       return { ticker, error: err.message, found: false };
     }

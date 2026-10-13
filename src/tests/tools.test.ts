@@ -326,12 +326,42 @@ describe('ToolRegistry', () => {
       expect(result.data.results[0]).toHaveProperty('url');
     }, 20000);
 
-    it('news_search returns recent articles via RSS providers', async () => {
-      const result = await exec('news_search', { query: 'Deutschland', hoursBack: 168 });
-      expect(result.success).toBe(true);
-      expect(Array.isArray(result.data.articles)).toBe(true);
-      expect(result.data.articles.length).toBeGreaterThan(0);
-      expect(result.data.articles[0].title).toBeTruthy();
+    it('news_search liefert Artikel über die GNews-API (gemockt, deterministisch)', async () => {
+      // news_search nutzt die GNews.io-API (gnews_search verwendet dieselbe).
+      // Ein Live-Test wäre nicht reproduzierbar (Demo-Key: 10 Anfragen/Tag,
+      // Netzwerk in der CI nicht garantiert) — daher fetch + Settings mocken.
+      const fetchCalls: string[] = [];
+      const origFetch = globalThis.fetch;
+      (globalThis as any).fetch = async (url: any) => {
+        fetchCalls.push(String(url));
+        return {
+          ok: true, status: 200,
+          json: async () => ({}),
+          text: async () => JSON.stringify({
+            totalArticles: 2,
+            articles: [
+              { title: 'Meldung eins', description: 'Text eins', url: 'https://example.com/a1', pubDate: '2026-10-13T10:00:00Z' },
+              { title: 'Meldung zwei', description: 'Text zwei', url: 'https://example.com/a2', pubDate: '2026-10-13T09:00:00Z' },
+            ],
+          }),
+        };
+      };
+      try {
+        const db = await import('../services/database');
+        vi.spyOn(db, 'getSettings').mockResolvedValue({ gnewsApiKey: 'test-key' } as any);
+
+        const result = await exec('news_search', { query: 'Deutschland' });
+        expect(result.success).toBe(true);
+        expect(Array.isArray(result.data.articles)).toBe(true);
+        expect(result.data.articles.length).toBeGreaterThan(0);
+        expect(result.data.articles[0].title).toBeTruthy();
+        expect(fetchCalls[0]).toContain('/api/v4/search?');
+        expect(fetchCalls[0]).toContain('q=Deutschland');
+        expect(fetchCalls[0]).toContain('apikey=test-key');
+      } finally {
+        vi.restoreAllMocks();
+        (globalThis as any).fetch = origFetch;
+      }
     }, 20000);
 
     it('weather returns current conditions for a city', async () => {

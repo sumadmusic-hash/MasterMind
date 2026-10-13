@@ -833,7 +833,14 @@ export class ChatOrchestrator {
       // duplicate call is still a full extra round-trip, so it must count
       // against the per-turn budget; otherwise models that repeat identical
       // calls could loop past the cap until maxToolSteps.
-      const usedBudget = resolvedToolCalls.length - pendingCalls.length + deferredDedupReplies.length;
+      // IMPORTANT: the EXECUTED calls were already counted one-by-one in the
+      // results loop above (`this.toolCallCount++`). Only the non-executed
+      // ones — deferred duplicates and budget-skipped calls — may be added
+      // here. Counting `resolvedToolCalls.length` in full double-billed every
+      // executed call and tripped the budget one step too early (the synthesis
+      // nudge was then suppressed on the following step).
+      const usedBudget = deferredDedupReplies.length
+        + (resolvedToolCalls.length - pendingCalls.length - deferredDedupReplies.length);
       this.toolCallCount += usedBudget;
       const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
