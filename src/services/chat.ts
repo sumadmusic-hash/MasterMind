@@ -15,6 +15,41 @@ import { buildMemoryPrompt } from './database';
 const COMPACT_RESULT_MAX_STRING = 150;
 const COMPACT_RESULT_MAX_ARRAY = 5;
 
+/**
+ * Runtime tool budget for SIMPLE factual questions (observed failure: "wer ist
+ * bundeskanzler?" burned 12k+ tokens on 4 tool calls — three searches plus a
+ * url_fetch — and the model still answered from stale training data because
+ * every extra step re-bills system prompt + tool catalogue + all prior tool
+ * results). Prompts are advice only, so the cap is enforced in code: when the
+ * user query is a short single-fact question without an explicit research
+ * order, at most ONE search call may execute per turn. Complex/analytical
+ * requests keep the regular budget (`maxToolCallsPerTurn`).
+ */
+const SIMPLE_QUERY_TOOL_BUDGET = 1;
+
+/**
+ * Classifies a user query as a simple factual question worth the cheap path.
+ * Conservative by design: any research/report/imperative signal disqualifies
+ * the query, so genuine multi-step tasks never lose tool budget.
+ */
+export function isSimpleFactQuery(text: string): boolean {
+  const q = (text || '').trim().toLowerCase();
+  if (!q) return false;
+  // Long inputs are compound tasks / pasted content, not a quick fact lookup.
+  if (q.length > 120) return false;
+  // Imperatives & research vocabulary → full task, keep normal budget.
+  if (/(?:^|\s)(?:recherchiere|research|analysier|untersuch|vergleiche|erstelle|berichte|zusammenfassen|fasse .{0,20} zusammen|erkl[aä]re .{0,30}(gründlich|detailliert|ausführlich)|step[- ]?by[- ]?step|pro |studie|report)/.test(q)) return false;
+  // Question words typical for one-fact lookups…
+  const asksFact = /(^(?:wer|was|welche[rms]?|wann|wie viele|wieviel|wie viel|wie spät|woher|wozu|wie hoch|wie tief|ist\b|sind\b|hat\b|hatte\b|wird\b)\b|[?！])/.test(q);
+  if (!asksFact) return false;
+  // Multi-part questions ("wer ist X und was macht Y?") need more than one call.
+  const questionMarks = (q.match(/[?]/g) || []).length;
+  if (questionMarks > 1) return false;
+  if (/\b(?:und|oder)\b.*[?]/.test(q) === false) return true;
+  // "und/oder" inside the question: still simple if it's one subject ("wer ist X oder Y")
+  return !/\bwelche\b.*\bund\b.*\bwelche\b|\b(?:wer|was|wann)\b.*\b(?:und|oder)\b.*\b(?:wer|was|wann)\b/i.test(q);
+}
+
 // Compact system prompt: the tool list was removed because full tool names,
 // descriptions and schemas are already sent via the API "tools" parameter —
 // repeating them here only wasted prompt tokens on every request. All quality
@@ -26,6 +61,10 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 - **MAX TOOL CALLS PER TURN:** 3. Bevorzuge Batch-Aufrufe.
 - **NO FLUFF:** Keine Einleitungen, Übergänge, Höflichkeitsfloskeln, Zusammenfassungen des eigenen Vorgehens.
 - **OUTPUT FORMAT:** Nur **strukturiertes Ergebnis** (Bulletpoints, Tabellen, JSON) + **Quellen-Array** am Ende.
+
+## 1.5 EINFACHE FAKTENFRAGEN (token-sparender Pfad)
+- **Erkennung:** kurze Frage nach EINEM Fakt ("wer ist…", "wie viele…", "wann…", "was ist…") ohne Research-Auftrag → MAXIMAL 1 Tool-Aufruf (\`ddg_web_search`\, `maxResults: 3`\), dann sofort die Antwort in 1–3 Sätzen + Quellenzeile. Kein url_fetch, kein Report-Format, keine Abschnitte für Unsicherheit/Gaps.
+- **Aktualität:** Bei Personen-/Amts-/Kurs-/Ereignisfragen ("wer ist X?", aktuelles Ergebnis) gilt das Modell-Wissen als VERALTET — erst Tool-Ergebnis abwarten und danach antworten. Niemals Wissensstand als "Stand …" verkaufen; wenn das Suchtool Fehler liefert, in EINEM Satz auf den Fehler verweisen statt ungeprüftes Trainingswissen auszugeben.
 
 ## 2. TOOL-REGELN (kostenlos: Schemas/Beschreibungen sind bereits im API-tools-Parameter)
 - \`ddg_web_search\`/\`web_search\`/\`news_search\`: \`maxResults: 3\` (bei News zusätzlich \`hoursBack: 24\`); \`ddg_web_search\` ist die DuckDuckGo-Websuche mit echten Suchergebnissen (Option \`timeRange: day/week/month/year\` für aktuelle Ereignisse)
@@ -331,6 +370,11 @@ export class ChatOrchestrator {
     // model asks for an unselected tool later in the turn, the catalogue is
     // widened once (see the tool-call branch below).
     const lastUserQuery = [...session.messages].reverse().find(m => m.role === 'user')?.content || '';
+    // Simple fact question → cheap runtime path (see SIMPLE_QUERY_TOOL_BUDGET):
+    // one search at most, and after it the model MUST answer from the result —
+    // never from its stale training data. Complex queries keep the full budget.
+    const simpleFactTurn = isSimpleFactQuery(lastUserQuery);
+    const effectiveToolBudget = simpleFactTurn ? SIMPLE_QUERY_TOOL_BUDGET : this.maxToolCallsPerTurn;
     let tools = toolRegistry.getToolDefinitionsForLLM(lastUserQuery);
     // Accumulates the FINAL answer text across steps. Previously it was reset
     // to '' at the end of every step, so when the max-steps limit was hit the
@@ -658,9 +702,10 @@ export class ChatOrchestrator {
 
       // Hard runtime cap on executed tool calls per turn (the prompt only
       // advises ≤3 — every extra call re-bills the whole history as prompt
-      // tokens). Once the budget is spent, remaining calls are answered via
-      // the protocol with a short note and the loop forces a final answer.
-      const callBudgetLeft = Math.max(0, this.maxToolCallsPerTurn - this.toolCallCount);
+      // tokens). Simple fact questions get a reduced budget of 1. Once the
+      // budget is spent, remaining calls are answered via the protocol with a
+      // short note and the loop forces a final answer.
+      const callBudgetLeft = Math.max(0, effectiveToolBudget - this.toolCallCount);
       if (pendingCalls.length > callBudgetLeft) {
         for (const dropped of pendingCalls.slice(callBudgetLeft)) {
           messages.push({
@@ -759,11 +804,13 @@ export class ChatOrchestrator {
       // Budget exhausted: force synthesis in the NEXT provider call. Without
       // this nudge the model tends to emit yet another tool-call step that
       // gets fully skipped — a wasted round-trip billing the whole history.
-      const budgetExhausted = this.toolCallCount >= this.maxToolCallsPerTurn;
+      const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
         messages.push({
           role: 'user',
-          content: 'Tool-Budget erschöpft. Erstelle JETZT die finale Antwort aus dem gesammelten Material (inkl. Quellen-Array); keine weiteren Tool-Aufrufe.',
+          content: simpleFactTurn
+            ? 'Keine weiteren Tools erlaubt. Antworte JETZT kurz (1–3 Sätze) direkt auf die Nutzerfrage — ausschließlich anhand des Suchergebnisses oben, NICHT anhand deines Trainingswissens. Zitiere die Quelle als URL. Falls das Suchergebnis einen Fehler enthält, sage das in einem Satz und gib keine unbestätigte Antwort.'
+            : 'Tool-Budget erschöpft. Erstelle JETZT die finale Antwort aus dem gesammelten Material (inkl. Quellen-Array); keine weiteren Tool-Aufrufe.',
         });
       }
 

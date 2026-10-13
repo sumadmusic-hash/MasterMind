@@ -173,3 +173,78 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
     expect(completed[0].content).toContain('Finale Antwort aus gesammeltem Material.');
   });
 });
+
+describe('simple fact question cheap path (token runaway fix)', () => {
+  // Regression: "wer ist bundeskanzler?" burned ~12k tokens on FOUR tool
+  // calls (3x ddg_web_search + url_fetch) and the model still answered from
+  // stale training data when the searches failed. Simple factual questions
+  // must now get a runtime budget of exactly ONE executed tool call, after
+  // which the loop forces a short synthesis answer from the search result.
+
+  it('isSimpleFactQuery classifies typical one-fact questions as simple', async () => {
+    const { isSimpleFactQuery } = await import('../services/chat');
+    expect(isSimpleFactQuery('wer ist bundeskanzler?')).toBe(true);
+    expect(isSimpleFactQuery('Wer ist Bundeskanzler')).toBe(true);
+    expect(isSimpleFactQuery('wie hoch ist der turm von aachen?')).toBe(true);
+    expect(isSimpleFactQuery('wann wurde köln gegründet?')).toBe(true);
+  });
+
+  it('isSimpleFactQuery keeps complex/research tasks on the normal budget', async () => {
+    const { isSimpleFactQuery } = await import('../services/chat');
+    expect(isSimpleFactQuery('recherchiere die Lage des deutschen Arbeitsmarkts und erstelle einen bericht')).toBe(false);
+    expect(isSimpleFactQuery('vergleiche Siemens und AEG hinsichtlich Umsatz, Marge und Zukunftsaussichten über die letzten 10 jahre')).toBe(false);
+    expect(isSimpleFactQuery('danke, sag Bescheid wenn du fertig bist')).toBe(false);
+    expect(isSimpleFactQuery('wer ist bundeskanzler? und wie wird er gewählt?')).toBe(false);
+  });
+
+  it('executes only ONE tool call for a simple question even if the model wants more', async () => {
+    const search1 = sseCall('s1', 'ddg_web_search', { query: 'bundeskanzler', maxResults: 3 });
+    const search2 = sseCall('s2', 'ddg_web_search', { query: 'bundeskanzler aktuell', maxResults: 3 });
+    const fetch1 = sseCall('f1', 'url_fetch', { url: 'https://de.wikipedia.org/wiki/Olaf_Scholz' });
+    scriptSteps([
+      { content: 'Ich suche.', toolCalls: [search1, search2, fetch1] }, // all in one step
+      { content: 'Aktueller Bundeskanzler ist Friedrich Merz (CDU). Quelle: https://…' },
+    ]);
+
+    const executed: string[] = [];
+    const session = makeSession();
+    session.messages[0].content = 'wer ist bundeskanzler?';
+    await new ChatOrchestrator().sendMessage(settings, session, undefined, {
+      onToken: () => {}, onToolCall: (c: any) => executed.push(c.toolId), onToolResult: () => {},
+      onComplete: () => {}, onError: () => {}, onStatus: () => {},
+    });
+
+    // Only the FIRST call executed; the other two were budget-skipped.
+    expect(executed).toEqual(['ddg_web_search']);
+
+    // The synthesis prompt carries the strict "answer from search result only"
+    // nudge so the model cannot fall back to its stale training knowledge.
+    const synthPrompt = promptAt(1);
+    const nudge = synthPrompt.find((m: any) => m.role === 'user' && m.content.includes('Keine weiteren Tools erlaubt'));
+    expect(nudge).toBeDefined();
+    expect(nudge.content).toContain('NICHT anhand deines Trainingswissens');
+    // Protocol stays valid: every tool_call got a reply (skipped ones included).
+    const assistant = synthPrompt.find((m: any) => m.role === 'assistant');
+    const ids = assistant.tool_calls.map((c: any) => c.id);
+    const replied = synthPrompt.filter((m: any) => m.role === 'tool').map((m: any) => m.tool_call_id);
+    expect(ids.every((id: string) => replied.includes(id))).toBe(true);
+  });
+
+  it('complex queries keep the regular per-turn tool budget (4)', async () => {
+    const calls = [1, 2, 3, 4].map(n => sseCall(`k${n}`, 'calculator', { expression: `${n}+0` }));
+    scriptSteps([
+      { toolCalls: calls },
+      { content: 'Fertig.' },
+    ]);
+
+    const executed: string[] = [];
+    const session = makeSession();
+    session.messages[0].content = 'recherchiere und vergleiche die Quartalszahlen: rechne 1+0, 2+0, 3+0, 4+0 aus';
+    await new ChatOrchestrator().sendMessage(settings, session, undefined, {
+      onToken: () => {}, onToolCall: (c: any) => executed.push(c.toolId), onToolResult: () => {},
+      onComplete: () => {}, onError: () => {}, onStatus: () => {},
+    });
+
+    expect(executed).toHaveLength(4);
+  });
+});
