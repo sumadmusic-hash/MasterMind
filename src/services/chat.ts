@@ -621,13 +621,26 @@ export class ChatOrchestrator {
       // Duplicate calls detected in this step; their tool messages are pushed
       // after the parallel execution so they can replay the real result.
       const deferredDedupReplies: { callId: string; signature: string }[] = [];
+      // Calls that never reach execution (invalid payload, duplicate id). The
+      // budget accounting below must count them — otherwise a model emitting
+      // garbage could loop past the per-turn cap until maxToolSteps.
+      let nonExecutedCalls = 0;
 
       for (const { raw: tc, id: preallocatedId } of resolvedToolCalls) {
         const callId = preallocatedId;
         turnCallIndex++;
 
-        // Prevent duplicate execution
-        if (this.processedToolCalls.has(callId)) continue;
+        // Prevent duplicate execution. The id was just minted for THIS step's
+        // assistant message, so a repeat id means the provider emitted a
+        // broken/duplicated delta — answering it with a tool message would put
+        // TWO tool responses under one tool_call into the prompt and Groq
+        // rejects that with a 400 ("tool message without preceding tool
+        // call"). Such calls are dropped from the assistant message as well
+        // (see the `announced` filter below) and only charged to the budget.
+        if (this.processedToolCalls.has(callId)) {
+          nonExecutedCalls++;
+          continue;
+        }
         this.processedToolCalls.add(callId);
 
         const toolName = (tc.function?.name || tc.name || '').trim();
@@ -833,14 +846,7 @@ export class ChatOrchestrator {
       // duplicate call is still a full extra round-trip, so it must count
       // against the per-turn budget; otherwise models that repeat identical
       // calls could loop past the cap until maxToolSteps.
-      // IMPORTANT: the EXECUTED calls were already counted one-by-one in the
-      // results loop above (`this.toolCallCount++`). Only the non-executed
-      // ones — deferred duplicates and budget-skipped calls — may be added
-      // here. Counting `resolvedToolCalls.length` in full double-billed every
-      // executed call and tripped the budget one step too early (the synthesis
-      // nudge was then suppressed on the following step).
-      const usedBudget = deferredDedupReplies.length
-        + (resolvedToolCalls.length - pendingCalls.length - deferredDedupReplies.length);
+      const usedBudget = resolvedToolCalls.length;
       this.toolCallCount += usedBudget;
       const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
