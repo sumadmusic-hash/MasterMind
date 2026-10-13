@@ -811,7 +811,14 @@ export class ChatOrchestrator {
             tool_call_id: toolCall.id,
           });
 
-          this.toolCallCount++;
+          // NOTE: no per-call `this.toolCallCount++` here. The budget is
+          // charged once for the whole step below via
+          // `this.toolCallCount += usedBudget` (usedBudget = ALL calls that
+          // consumed budget this turn: executed, dedup-skipped and
+          // budget-skipped). Incrementing per executed call IN ADDITION made
+          // every executed call count TWICE, so the budget tripped after half
+          // as many calls as configured — the loop ended prematurely and the
+          // synthesis nudge fired too early.
         }
       }
 
