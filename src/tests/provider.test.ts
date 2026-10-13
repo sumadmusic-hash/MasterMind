@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getModelCatalog, getAllModels, detectRefusal } from '../services/provider';
+import { getModelCatalog, getAllModels, detectRefusal, resolveGeminiModel } from '../services/provider';
 
 describe('Provider Service', () => {
   it('should return Groq model catalog', () => {
@@ -19,9 +19,27 @@ describe('Provider Service', () => {
   it('should return Gemini model catalog (free Google AI Studio API)', () => {
     const models = getModelCatalog('gemini');
     expect(models.length).toBeGreaterThan(0);
-    const flash = models.find(m => m.id === 'gemini-2.5-flash');
+    // gemini-2.5-flash wurde von Google für neue Nutzer abgekündigt (HTTP 404)
+    // und darf daher nicht mehr im Katalog stehen.
+    const retired = models.find(m => m.id === 'gemini-2.5-flash');
+    expect(retired).toBeUndefined();
+    const flash = models.find(m => m.id === 'gemini-3-flash');
     expect(flash).toBeDefined();
     expect(flash?.supportsTools).toBe(true);
+  });
+
+  it('should map retired Gemini models to their current successors', () => {
+    // Google liefert 404 "no longer available to new users" für alte ids —
+    // gespeicherte Einstellungen müssen automatisch auf den Nachfolger laufen.
+    expect(resolveGeminiModel('gemini-2.5-flash')).toBe('gemini-3-flash');
+    expect(resolveGeminiModel('gemini-2.5-flash-lite')).toBe('gemini-flash-lite-latest');
+    expect(resolveGeminiModel('gemini-2.0-flash')).toBe('gemini-flash-latest');
+    expect(resolveGeminiModel('gemini-2.5-pro')).toBe('gemini-3-pro-preview');
+    // Voll qualifiziert (copy-paste aus OpenRouter-Namen) + Prefix stripping
+    expect(resolveGeminiModel('google/gemini-2.5-flash')).toBe('gemini-3-flash');
+    // Aktuelle ids bleiben unverändert
+    expect(resolveGeminiModel('gemini-3-flash')).toBe('gemini-3-flash');
+    expect(resolveGeminiModel('gemini-flash-latest')).toBe('gemini-flash-latest');
   });
 
   it('should return empty for unknown provider', () => {
