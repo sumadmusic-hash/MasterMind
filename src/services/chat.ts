@@ -440,6 +440,10 @@ export class ChatOrchestrator {
     // ids were missing, so `processedToolCalls` swallowed every call after the
     // first one and their results never reached the model (broken protocol).
     let turnCallIndex = 0;
+    // Number of provider calls made inside the agent loop (0-based index of
+    // the NEXT call). Needed to recognise the dedicated synthesis round-trip:
+    // it is always the FIRST call made after a step that exhausted the budget.
+    let providerCallIndex = 0;
     // Deduplicate tool calls by (name + arguments): models often repeat the
     // exact same call across steps, which wastes both execution time and
     // prompt tokens for the duplicated results.
@@ -447,9 +451,46 @@ export class ChatOrchestrator {
     // identical call was already executed, the skip message must still be
     // keyed to the CURRENT call's protocol id (see the dedup branch below).
     const seenToolSignatures = new Map<string, string>();
+    // Signature cache for CROSS-STEP duplicates: signature -> the compacted
+    // JSON payload of the producing call's result (WITHOUT the note field).
+    // The per-turn `seenToolSignatures` map only knows WHICH call produced a
+    // result; this cache stores the ready-to-send body so a duplicate can be
+    // answered immediately — in the very step it appears in — without paying
+    // for a re-execution or an extra round-trip. Filled right after each
+    // executed result is compacted (see the execution loop), which also
+    // removes the double stringify/re-compact the old replay path performed.
+    const dedupPayloadCache = new Map<string, string>();
+    // Protocol ids whose EXECUTED result must additionally be announced to the
+    // model as a cached replay ("identical call skipped – cached result").
+    // Two producers land here:
+    //  - intra-step siblings: several identical calls in ONE batch share a
+    //    single execution; every non-producer gets this id via the dedup
+    //    branch below and must see the real value keyed to its own call id;
+    //  - cross-step duplicates: filled when a duplicate from an EARLIER step
+    //    is finally promoted into the conversation (see the promotion pass
+    //    after the budget trim) — the replay then keys to the duplicate's id.
+    const replaySourceIds = new Set<string>();
+    // Cross-step duplicate replies detected during the prepare loop, buffered
+    // per STEP until it is clear the duplicate's tool_call stays in the
+    // conversation (the budget trim may drop the announcement — Groq rejects a
+    // tool response without a preceding tool_call with a 400). Turn-level, not
+    // step-level: a duplicate detected in step N must be promoted at the end
+    // of step N, even when that step executes NO tools itself (otherwise its
+    // assistant message would carry an unmatched tool_call into the next
+    // prompt — broken protocol).
+    const pendingDedupByStep = new Map<number, { callId: string; signature: string }[]>();
     // One retry is allowed when a model returns a completely empty reply
     // (no text, no tools) before anything was accomplished this turn.
     let emptyRetryUsed = false;
+    // Pre-allocated messages for the mandatory synthesis round-trip that runs
+    // once the per-turn tool budget is exhausted. The loop sets these when the
+    // budget trips and BREAKS immediately: the synthesis call below consumes
+    // them as the final prompt. Without this, the next loop iteration would
+    // run a full extra tool-enabled round-trip whose tool calls all get
+    // budget-skipped — a wasted step that re-bills the entire history and
+    // (as regression-tested) also answered duplicate calls with a bare hint
+    // instead of the cached result.
+    let synthMessages: ProviderMessage[] | null = null;
 
     // Replay completed work from a previously interrupted turn: if the last
     // assistant message is an interruption marker that carries tool calls AND
@@ -472,6 +513,7 @@ export class ChatOrchestrator {
         this.pendingResumeNote = false;
       }
 
+      providerCallIndex++;
       try {
         const result = await callProvider(
           settings,
