@@ -63,7 +63,7 @@ const SYSTEM_PROMPT = `# ⚙️ SYSTEM INSTRUCTIONS — TOKEN-EFFICIENT RESEARCH
 - **OUTPUT FORMAT:** Nur **strukturiertes Ergebnis** (Bulletpoints, Tabellen, JSON) + **Quellen-Array** am Ende.
 
 ## 1.5 EINFACHE FAKTENFRAGEN (token-sparender Pfad)
-- **Erkennung:** kurze Frage nach EINEM Fakt ("wer ist…", "wie viele…", "wann…", "was ist…") ohne Research-Auftrag → MAXIMAL 1 Tool-Aufruf (\`ddg_web_search`\, `maxResults: 3`\), dann sofort die Antwort in 1–3 Sätzen + Quellenzeile. Kein url_fetch, kein Report-Format, keine Abschnitte für Unsicherheit/Gaps.
+- **Erkennung:** kurze Frage nach EINEM Fakt ("wer ist…", "wie viele…", "wann…", "was ist…") ohne Research-Auftrag → MAXIMAL 1 Tool-Aufruf (\`ddg_web_search\`, \`maxResults: 3\`), dann sofort die Antwort in 1–3 Sätzen + Quellenzeile. Kein url_fetch, kein Report-Format, keine Abschnitte für Unsicherheit/Gaps.
 - **Aktualität:** Bei Personen-/Amts-/Kurs-/Ereignisfragen ("wer ist X?", aktuelles Ergebnis) gilt das Modell-Wissen als VERALTET — erst Tool-Ergebnis abwarten und danach antworten. Niemals Wissensstand als "Stand …" verkaufen; wenn das Suchtool Fehler liefert, in EINEM Satz auf den Fehler verweisen statt ungeprüftes Trainingswissen auszugeben.
 
 ## 2. TOOL-REGELN (kostenlos: Schemas/Beschreibungen sind bereits im API-tools-Parameter)
@@ -696,7 +696,6 @@ export class ChatOrchestrator {
         }
         seenToolSignatures.set(signature, callId);
 
-        callbacks.onToolCall(toolCall);
         pendingCalls.push(toolCall);
       }
 
@@ -705,9 +704,14 @@ export class ChatOrchestrator {
       // tokens). Simple fact questions get a reduced budget of 1. Once the
       // budget is spent, remaining calls are answered via the protocol with a
       // short note and the loop forces a final answer.
+      // NOTE: the trimming must happen BEFORE any call is announced via
+      // onToolCall: the callback signals actual EXECUTION, so budget-skipped
+      // calls must never be reported as started (previously the UI/telemetry
+      // showed every queued call as running even though most were skipped).
       const callBudgetLeft = Math.max(0, effectiveToolBudget - this.toolCallCount);
       if (pendingCalls.length > callBudgetLeft) {
         for (const dropped of pendingCalls.slice(callBudgetLeft)) {
+          stepSkippedIds.add(dropped.id);
           messages.push({
             role: 'tool',
             content: JSON.stringify({ skipped: 'Tool-Budget für diesen Turn erschöpft. Antworte jetzt mit dem gesammelten Material.' }),
@@ -717,6 +721,9 @@ export class ChatOrchestrator {
         }
         pendingCalls.length = callBudgetLeft;
       }
+
+      // Announce the surviving calls now that the budget trim is settled.
+      for (const c of pendingCalls) callbacks.onToolCall(c);
 
       // Protocol invariant: EVERY tool_call in the assistant message needs a
       // matching tool message. Invalid/duplicate/budget-skipped calls got
