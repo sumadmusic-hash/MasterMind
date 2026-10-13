@@ -5,7 +5,6 @@
  * Genutzt von stock_price, stock_analysis, company_lookup und portfolio_overview.
  */
 
- */
 export async function fetchYahooFundamentals(ticker: string): Promise<any | null> {
   const headers = { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' };
   let out: Record<string, any> = {};
