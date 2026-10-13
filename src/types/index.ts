@@ -29,6 +29,10 @@ export const AppSettingsSchema = z.object({
   gnewsApiKey: z.string().optional(),
   // Optionale Basis-URL für GNews-Aufrufe (CORS-Proxy). Leer = Vite-Dev-Proxy /gnews-api.
   gnewsApiBaseUrl: z.string().optional(),
+  // Optionale Basis-URL für html.duckduckgo.com (ddg_web_search/web_search).
+  // html.duckduckgo.com sendet keine CORS-Headers, daher läuft die Suche im
+  // Browser über einen Proxy-Pfad. Leer = Vite-Dev-Proxy /ddg-api.
+  ddgApiBaseUrl: z.string().optional(),
   primaryModel: ModelConfigSchema,
   // Fallback-Kette: bis zu 6 Modelle, der Reihe nach ausprobiert, wenn das
   // vorherige Modell fehlschlägt (Rate-Limit, Serverfehler, fehlender API-Key …).

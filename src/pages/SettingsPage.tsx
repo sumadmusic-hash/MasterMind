@@ -482,6 +482,23 @@ export function SettingsPage() {
               </div>
 
               <div>
+                <label className="text-sm text-gray-400 mb-1 block">DuckDuckGo Proxy-Basis (optional)</label>
+                <input
+                  type="text"
+                  value={settings.ddgApiBaseUrl || ''}
+                  onChange={e => updateSettings({ ddgApiBaseUrl: e.target.value })}
+                  placeholder="leer = /ddg-api (Vite-Dev-Proxy)"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  html.duckduckgo.com sendet keine CORS-Headers – ohne Proxy bricht die Websuche im
+                  Browser mit "Failed to fetch" ab. Für Produktions-Builds hier die Basis eines
+                  eigenen Proxys eintragen (z. B. https://proxy.example.de/ddg), der GET-Requests an
+                  https://html.duckduckgo.com/ weiterreicht.
+                </p>
+              </div>
+
+              <div>
                 <label className="text-sm text-gray-400 mb-1 block">Max Tool Steps per Request</label>
                 <input
                   type="number"

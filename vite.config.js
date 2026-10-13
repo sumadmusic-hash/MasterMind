@@ -65,6 +65,26 @@ export default defineConfig({
         secure: true,
         rewrite: (path) => path.replace(/^\/gnews-api/, ''),
       },
+      // DuckDuckGo-Suche (ddg_web_search/web_search): html.duckduckgo.com sendet
+      // keine CORS-Headers – ein direkter Browser-Fetch (POST) scheitert daher
+      // mit "TypeError: Failed to fetch", noch bevor der Fehler-Handler greift.
+      // Der Endpunkt ist aber als GET-Anfrage unter https://html.duckduckgo.com/
+      // (Pfad "/", nicht "/html/") erreichbar – dieser Proxy leitet GETs ohne
+      // Query-String auf "/" um und entfernt den /ddg-api-Präfix.
+      // In Produktion durch eine eigene Proxy-Basis in den Settings
+      // (ddgApiBaseUrl) ersetzen.
+      '/ddg-api': {
+        target: 'https://html.duckduckgo.com',
+        changeOrigin: true,
+        secure: true,
+        rewrite: (path) => {
+          const stripped = path.replace(/^\/ddg-api/, '') || '/';
+          return /^\/html\//.test(stripped) ? stripped : '/';
+        },
+      },
+      // Hinweis: die Instant Answer API (api.duckduckgo.com) sendet CORS-Headers
+      // und wird vom Tool weiterhin direkt aufgerufen; dieser Proxy deckt nur
+      // den CORS-freien html.duckduckgo.com-Endpunkt ab.
     },
   },
 });
