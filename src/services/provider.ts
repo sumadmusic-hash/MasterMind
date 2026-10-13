@@ -47,15 +47,49 @@ const MODEL_CATALOGS: Record<string, { id: string; name: string; contextWindow: 
     { id: 'mistralai/mixtral-8x7b-instruct', name: 'Mixtral 8x7B', contextWindow: 32768, supportsTools: true },
   ],
   // Google Gemini API (AI Studio) — kostenlos nutzbar mit kostenlosem API-Key
-  // von https://aistudio.google.com/apikey (Tier "Free": u. a. 15 RPM /
-  // 1500 Anfragen pro Tag für Gemini 2.5 Flash, ohne Kreditkarte).
+  // von https://aistudio.google.com/apikey (Tier "Free", ohne Kreditkarte).
+  // Achtung: Google nimmt laufend alte Modellvarianten für NEUE Nutzer aus dem
+  // Programm (gemini-2.5-flash/-lite und gemini-2.0-flash liefern inzwischen
+  // HTTP 404 "no longer available to new users"). Deshalb stehen hier nur noch
+  // aktuelle GA-/Preview-Modelle; RETIRED_GEMINI_MODELS mappt abgekündigte ids
+  // auf ihren Nachfolger, damit bereits gespeicherte Einstellungen automatisch
+  // weiterfunktion (siehe resolveGeminiModel()).
   gemini: [
-    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (kostenlos)', contextWindow: 1048576, supportsTools: true },
-    { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite (kostenlos)', contextWindow: 1048576, supportsTools: true },
-    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', contextWindow: 1048576, supportsTools: true },
-    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-3-flash', name: 'Gemini 3 Flash (kostenlos)', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash Preview (kostenlos)', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-flash-latest', name: 'Gemini Flash Latest (kostenlos, immer aktuell)', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-flash-lite-latest', name: 'Gemini Flash Lite Latest (kostenlos, immer aktuell)', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro Preview', contextWindow: 1048576, supportsTools: true },
   ],
 };
+
+/**
+ * Abgekündigte Gemini-Modell-ids → aktueller Nachfolger. Wird angewendet,
+ * bevor eine Anfrage an die API geht (resolveGeminiModel), damit Nutzer mit
+ * älteren gespeicherten Einstellungen nicht mehr gegen die 404-Wand laufen.
+ */
+const RETIRED_GEMINI_MODELS: Record<string, string> = {
+  'gemini-2.5-flash': 'gemini-3-flash',
+  'gemini-2.5-flash-lite': 'gemini-flash-lite-latest',
+  'gemini-2.0-flash': 'gemini-flash-latest',
+  'gemini-2.0-flash-lite': 'gemini-flash-lite-latest',
+  'gemini-2.5-pro': 'gemini-3-pro-preview',
+  'gemini-2.0-pro-exp-02-05': 'gemini-3-pro-preview',
+};
+
+/**
+ * Resolve a Gemini model id for the Generative Language API:
+ * - strip provider prefixes ("google/gemini-2.5-flash" -> "gemini-2.5-flash")
+ * - replace retired models with their current successor (Google returns
+ *   HTTP 404 "This model models/gemini-2.5-flash is no longer available to
+ *   new users" for deprecated variants on free-tier keys)
+ */
+export function resolveGeminiModel(modelId: string): string {
+  const id = (modelId || '').trim();
+  const slash = id.lastIndexOf('/');
+  const bare = slash >= 0 ? id.slice(slash + 1) : id;
+  return RETIRED_GEMINI_MODELS[bare] || bare;
+}
 
 export function getModelCatalog(provider: string) {
   return MODEL_CATALOGS[provider] || [];
@@ -218,11 +252,12 @@ function getApiKey(settings: AppSettings, provider: string): string | undefined 
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 
 /** Some model ids arrive fully qualified (e.g. "google/gemini-2.5-flash" from
- *  copy-paste); the Generative Language API expects the bare model name. */
+ *  copy-paste); the Generative Language API expects the bare model name.
+ *  Retired ids are transparently mapped to their current successor (see
+ *  resolveGeminiModel) so stored settings keep working after Google
+ *  deprecates a model for new users (HTTP 404). */
 function normalizeGeminiModelId(modelId: string): string {
-  const id = (modelId || '').trim();
-  const slash = id.lastIndexOf('/');
-  return slash >= 0 ? id.slice(slash + 1) : id;
+  return resolveGeminiModel(modelId);
 }
 
 function buildGeminiRequestUrl(modelId: string, streaming: boolean): string {
@@ -762,11 +797,26 @@ export async function callProvider(
         continue;
       }
 
+      // Rate limited, try fallback
       if (err.status === 429) {
-        // Rate limited, try fallback
         continue;
       }
-      
+
+      // Deprecated model (Google: HTTP 404 "This model models/<id> is no
+      // longer available to new users"). The message contains the model name,
+      // so log which id should be swapped for its successor — otherwise the
+      // user only sees a bare "404" in the logs. (The request URL itself is
+      // already built via resolveGeminiModel, which transparently maps known
+      // retired ids to their current successor.)
+      if (err.status === 404 && config.provider === 'gemini') {
+        await addLog({
+          level: 'warn',
+          message: `Modell "${config.modelId}" ist bei Google nicht mehr verfügbar (404) – bitte in den Einstellungen durch ein aktuelles Gemini-Modell ersetzen. Fallback übernimmt.`,
+          timestamp: Date.now(),
+        });
+        continue;
+      }
+
       if (err.status >= 500) {
         // Server error, try fallback
         continue;
@@ -1142,6 +1192,15 @@ export async function testConnection(provider: string, apiKey: string, modelId: 
 
       if (!response.ok) {
         const body = await response.text();
+        // Google meldet abgekündigte Modelle mit HTTP 404 und dem Hinweis
+        // "no longer available to new users" — als Klartext zurückgeben,
+        // statt den rohen JSON-Fehlerblock anzuzeigen. (Bekannte retired ids
+        // werden von resolveGeminiModel bereits automatisch auf ihren
+        // Nachfolger abgebildet; ein 404 bedeutet hier, dass das Modell
+        // weder bekannt noch verfügbar ist.)
+        if (response.status === 404 && /no longer available|NOT_FOUND/i.test(body)) {
+          return { success: false, error: `Modell "${modelId}" ist bei Google nicht mehr verfügbar (404). Bitte ein aktuelles Gemini-Modell auswählen, z. B. „Gemini 3 Flash“ oder „Gemini Flash Latest“.` };
+        }
         return { success: false, error: `${response.status}: ${body}` };
       }
 

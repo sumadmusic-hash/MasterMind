@@ -38,7 +38,7 @@ export function SettingsPage() {
     const modelId = provider === 'groq' 
       ? (settings.primaryModel.provider === 'groq' ? settings.primaryModel.modelId : 'llama-3.3-70b-versatile')
       : provider === 'gemini'
-      ? (settings.primaryModel.provider === 'gemini' ? settings.primaryModel.modelId : 'gemini-2.5-flash')
+      ? (settings.primaryModel.provider === 'gemini' ? settings.primaryModel.modelId : 'gemini-3-flash')
       : (settings.primaryModel.provider === 'openrouter' ? settings.primaryModel.modelId : 'openai/gpt-4o-mini');
 
     if (!apiKey) {
@@ -601,7 +601,7 @@ function ModelSelector({ label, config, onChange, optional }: {
           onChange={e => onChange({ ...config, modelId: e.target.value })}
           placeholder={
             config?.provider === 'openrouter' ? 'z. B. openai/gpt-4o-mini'
-            : config?.provider === 'gemini' ? 'z. B. gemini-2.5-flash'
+            : config?.provider === 'gemini' ? 'z. B. gemini-3-flash'
             : 'z. B. llama-3.3-70b-versatile'
           }
           className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
