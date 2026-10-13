@@ -867,7 +867,7 @@ export async function callProvider(
       if (geminiBlocked || detectRefusal(result.content)) {
         // The refusing model consumed budget; account for its real usage
         // before handing over to the fallback.
-        tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
+        tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId ?? undefined);
         reservationId = null;
         await recordTokenUsage({ ...result.usage, provider: config.provider, model: config.modelId });
         sawRefusal = true;
@@ -881,7 +881,7 @@ export async function callProvider(
       // although every previous step already burned tokens. Hand the identical
       // request to the next model in the chain instead.
       if (isEmptyResponse(result.content, result.toolCallCount)) {
-        tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
+        tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId ?? undefined);
         reservationId = null;
         await recordTokenUsage({ ...result.usage, provider: config.provider, model: config.modelId });
         sawRefusal = true;
@@ -891,7 +891,7 @@ export async function callProvider(
       // Update TPM with actual usage AND release this request's reservation in
       // one step. Previously the reservation was never released on success, so
       // its tokens were double-counted (reserved + used) until the 30s expiry.
-      tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
+      tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId ?? undefined);
       reservationId = null;
       await recordTokenUsage({ ...result.usage, provider: config.provider, model: config.modelId });
 
