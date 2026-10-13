@@ -46,6 +46,15 @@ const MODEL_CATALOGS: Record<string, { id: string; name: string; contextWindow: 
     { id: 'google/gemini-pro-1.5', name: 'Gemini Pro 1.5', contextWindow: 2000000, supportsTools: true },
     { id: 'mistralai/mixtral-8x7b-instruct', name: 'Mixtral 8x7B', contextWindow: 32768, supportsTools: true },
   ],
+  // Google Gemini API (AI Studio) — kostenlos nutzbar mit kostenlosem API-Key
+  // von https://aistudio.google.com/apikey (Tier "Free": u. a. 15 RPM /
+  // 1500 Anfragen pro Tag für Gemini 2.5 Flash, ohne Kreditkarte).
+  gemini: [
+    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (kostenlos)', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite (kostenlos)', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', contextWindow: 1048576, supportsTools: true },
+    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: 1048576, supportsTools: true },
+  ],
 };
 
 export function getModelCatalog(provider: string) {
@@ -165,6 +174,7 @@ export function getAllModels() {
   return {
     groq: MODEL_CATALOGS.groq,
     openrouter: MODEL_CATALOGS.openrouter,
+    gemini: MODEL_CATALOGS.gemini,
   };
 }
 
@@ -172,6 +182,10 @@ function getApiUrl(provider: string): string {
   switch (provider) {
     case 'groq': return 'https://api.groq.com/openai/v1/chat/completions';
     case 'openrouter': return 'https://openrouter.ai/api/v1/chat/completions';
+    // Gemini nutzt eine eigene URL, die das Modell enthält (:streamGenerateContent
+    // bzw. :generateContent) — buildGeminiRequestUrl setzt sie zusammen. Der
+    // Basis-Eintrag hier dient nur der "Provider bekannt"-Prüfung im Fallback-Loop.
+    case 'gemini': return 'https://generativelanguage.googleapis.com/v1beta';
     default: throw new Error(`Unknown provider: ${provider}`);
   }
 }
@@ -180,8 +194,339 @@ function getApiKey(settings: AppSettings, provider: string): string | undefined 
   switch (provider) {
     case 'groq': return settings.groqApiKey;
     case 'openrouter': return settings.openRouterApiKey;
+    case 'gemini': return settings.geminiApiKey;
     default: return undefined;
   }
+}
+
+// ============ Google Gemini (Generative Language API) ============
+//
+// Gemini spricht NICHT das OpenAI-Format, sondern ein eigenes REST-API:
+//   POST https://generativelanguage.googleapis.com/v1beta/models/<model>:generateContent
+//   POST .../models/<model>:streamGenerateContent?alt=sse   (SSE wie OpenAI)
+// Authentifizierung: Header `x-goog-api-key`. Ein kostenloser API-Key ist ohne
+// Kreditkarte unter https://aistudio.google.com/apikey erhältlich (Free-Tier).
+//
+// Formatunterschiede, die die folgenden Helfer abdecken:
+// - System-Prompt: separates Feld `systemInstruction` statt system-Nachricht
+// - Rollen: user/model statt user/assistant; Tool-Ergebnisse als
+//   `{role:'user', parts:[{functionResponse:{name,response}}]}`
+// - assistant tool_calls -> `parts:[{functionCall:{name,args}}]`
+// - Tools: `{functionDeclarations:[{name,description,parameters}]}` (OpenAPI-Schema)
+// - usageMetadata: promptTokenCount/candidatesTokenCount/totalTokenCount
+
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+
+/** Some model ids arrive fully qualified (e.g. "google/gemini-2.5-flash" from
+ *  copy-paste); the Generative Language API expects the bare model name. */
+function normalizeGeminiModelId(modelId: string): string {
+  const id = (modelId || '').trim();
+  const slash = id.lastIndexOf('/');
+  return slash >= 0 ? id.slice(slash + 1) : id;
+}
+
+function buildGeminiRequestUrl(modelId: string, streaming: boolean): string {
+  const model = normalizeGeminiModelId(modelId);
+  const suffix = streaming ? ':streamGenerateContent?alt=sse' : ':generateContent';
+  return `${GEMINI_BASE_URL}/models/${model}${suffix}`;
+}
+
+/**
+ * Convert OpenAI-style provider messages into Gemini's request body fields.
+ * Returns `contents` + `systemInstruction`. Consecutive same-role messages are
+ * merged into one content entry because Gemini requires strictly alternating
+ * user/model turns and rejects adjacent duplicates of the same role.
+ */
+export function toGeminiContents(messages: ProviderMessage[]): {
+  contents: any[];
+  systemInstruction?: { role: string; parts: { text: string }[] };
+} {
+  const contents: any[] = [];
+  let systemText = '';
+
+  const push = (role: string, parts: any[]) => {
+    if (!parts.length) return;
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) {
+      last.parts.push(...parts);
+    } else {
+      contents.push({ role, parts });
+    }
+  };
+
+  for (const m of messages) {
+    if (m.role === 'system') {
+      systemText += (systemText ? '\n\n' : '') + (m.content || '');
+      continue;
+    }
+    if (m.role === 'tool') {
+      // Tool result -> functionResponse part. The originating assistant message
+      // (with its functionCall parts) is already in `contents`, so no thought
+      // signature is needed here (that is only required for thinking models'
+      // own functionCall round-trips with valid signatures).
+      push('user', [{
+        functionResponse: {
+          name: m.name || 'tool',
+          response: parseToolResult(m.content),
+        },
+      }]);
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const parts: any[] = [];
+      if ((m.content || '').trim()) parts.push({ text: m.content });
+      for (const tc of m.tool_calls || []) {
+        parts.push({
+          functionCall: {
+            name: tc.function?.name || tc.name || '',
+            args: safeParseJson(tc.function?.arguments ?? tc.arguments ?? '{}', {}),
+          },
+        });
+      }
+      push('model', parts);
+      continue;
+    }
+    // user (and anything unknown)
+    push('user', [{ text: m.content || '' }]);
+  }
+
+  return {
+    contents,
+    systemInstruction: systemText
+      ? { role: 'system', parts: [{ text: systemText }] }
+      : undefined,
+  };
+}
+
+function safeParseJson(str: string, fallback: any): any {
+  try { return JSON.parse(str); } catch { return fallback; }
+}
+
+/** Tool results travel as JSON strings on the OpenAI wire; Gemini wants an
+ *  object in functionResponse.response. Non-JSON payloads are wrapped. */
+function parseToolResult(content: string): any {
+  const parsed = safeParseJson(content || '', null);
+  if (parsed !== null && typeof parsed === 'object') return parsed;
+  return { result: content ?? '' };
+}
+
+/** Strip keys that are invalid in the Gemini function-declaration schema. */
+function toGeminiParameters(schema: any): any {
+  const clean = normalizeJsonSchema(schema);
+  if (clean && typeof clean === 'object') {
+    // Gemini rejects `additionalProperties` in function parameter schemas.
+    delete clean.additionalProperties;
+    // propertyOrdering is a Gemini-specific hint; harmless but not needed.
+    delete clean.propertyOrdering;
+  }
+  return clean;
+}
+
+function toGeminiTools(tools?: any[]): any[] | undefined {
+  if (!tools || tools.length === 0) return undefined;
+  const declarations = tools.map(t => ({
+    name: t.name,
+    description: t.description,
+    parameters: toGeminiParameters(t.inputSchema),
+  }));
+  return [{ functionDeclarations: declarations }];
+}
+
+/** Map a finishReason to our refusal semantics so the fallback chain behaves
+ *  exactly like it does for Groq/OpenRouter safety blocks. */
+function geminiFinishReasonRefusal(finishReason: string | undefined): boolean {
+  if (!finishReason) return false;
+  return /SAFETY|RECITATION|PROHIBITED|BLOCKLIST|SPII|IMAGE_SAFETY/i.test(finishReason);
+}
+
+interface GeminiCallResult {
+  content: string;
+  usage: TokenUsage;
+  toolCallCount: number;
+  /** Raw OpenAI-shaped tool calls, forwarded via callbacks.onToolCall */
+  toolCalls: any[];
+  finishReason?: string;
+}
+
+function estimateTokensFromMessages(messages: ProviderMessage[]): number {
+  return estimateTokens(messages);
+}
+
+/** Execute one Gemini request (streaming or non-streaming). */
+async function executeGeminiCall(
+  config: ModelConfig,
+  apiKey: string,
+  messages: ProviderMessage[],
+  tools: any[] | undefined,
+  callbacks: StreamCallbacks | undefined,
+  combinedSignal: AbortSignal,
+  settings: AppSettings,
+): Promise<GeminiCallResult> {
+  const streaming = !!callbacks?.onToken;
+  const { contents, systemInstruction } = toGeminiContents(messages);
+
+  const body: any = { contents };
+  if (systemInstruction) body.systemInstruction = systemInstruction;
+  const geminiTools = toGeminiTools(tools);
+  if (geminiTools) body.tools = geminiTools;
+  body.generationConfig = {
+    maxOutputTokens: settings.maxTokensPerRequest,
+    temperature: 0.7,
+  };
+
+  const url = buildGeminiRequestUrl(config.modelId, streaming);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      // Gemini authenticates via this header (NOT Authorization: Bearer).
+      'x-goog-api-key': apiKey,
+    },
+    body: JSON.stringify(body),
+    signal: combinedSignal,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    const err: any = new Error(`Provider error: ${response.status} - ${errorBody}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  if (streaming) {
+    return handleGeminiStreamingResponse(response, callbacks!, messages);
+  }
+
+  const data = await response.json();
+  return extractGeminiResult(data, messages);
+}
+
+function extractGeminiResult(data: any, requestMessages?: ProviderMessage[]): GeminiCallResult {
+  const candidate = data?.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+  let content = '';
+  const toolCalls: any[] = [];
+  for (const p of parts) {
+    if (p.text) content += p.text;
+    if (p.functionCall?.name) {
+      toolCalls.push({
+        id: `gemini_${toolCalls.length}`,
+        type: 'function',
+        function: {
+          name: p.functionCall.name,
+          // Gemini sends args as an object; chat.ts expects a JSON string.
+          arguments: JSON.stringify(p.functionCall.args ?? {}),
+        },
+      });
+    }
+  }
+
+  const um = data?.usageMetadata || {};
+  const promptTokens = um.promptTokenCount ||
+    (requestMessages ? estimateTokensFromMessages(requestMessages) : 0);
+  const completionTokens =
+    (um.candidatesTokenCount ?? 0) + (um.thoughtsTokenCount ?? 0) ||
+    Math.ceil((content.length + JSON.stringify(toolCalls).length) / 4);
+  const totalTokens = um.totalTokenCount || promptTokens + completionTokens;
+
+  const usage: TokenUsage = {
+    provider: 'gemini',
+    model: '',
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    estimated: !um.promptTokenCount,
+    timestamp: Date.now(),
+  };
+
+  return { content, usage, toolCallCount: toolCalls.length, toolCalls, finishReason: candidate?.finishReason };
+}
+
+/** Parse a Gemini SSE stream (`alt=sse` emits OpenAI-compatible `data:` frames). */
+export async function handleGeminiStreamingResponse(
+  response: Response,
+  callbacks: StreamCallbacks,
+  requestMessages?: ProviderMessage[],
+): Promise<GeminiCallResult> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('No response body');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const chunks: any[] = [];
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.replace(/\r$/, '');
+    if (!line.startsWith('data:')) return;
+    const rest = line.slice(5);
+    const data = rest.startsWith(' ') ? rest.slice(1) : rest;
+    if (!data || data === '[DONE]') return;
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') chunks.push(parsed);
+    } catch {
+      // Skip malformed events (same policy as the OpenAI-style parser)
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) processLine(line);
+  }
+  if (buffer) processLine(buffer);
+
+  // Merge streamed candidates: text concatenates, functionCalls accumulate.
+  let content = '';
+  const toolCalls: any[] = [];
+  let usageMetadata: any = null;
+  let finishReason: string | undefined;
+  for (const c of chunks) {
+    const cand = c?.candidates?.[0];
+    for (const p of cand?.content?.parts || []) {
+      if (p.text) {
+        content += p.text;
+        callbacks.onToken(p.text);
+      }
+      if (p.functionCall?.name) {
+        toolCalls.push({
+          id: `gemini_${toolCalls.length}`,
+          type: 'function',
+          function: {
+            name: p.functionCall.name,
+            arguments: JSON.stringify(p.functionCall.args ?? {}),
+          },
+        });
+      }
+    }
+    if (cand?.finishReason) finishReason = cand.finishReason;
+    if (c.usageMetadata) usageMetadata = c.usageMetadata;
+  }
+
+  for (const tc of toolCalls) callbacks.onToolCall(tc);
+
+  const promptTokens = usageMetadata?.promptTokenCount ||
+    (requestMessages ? estimateTokensFromMessages(requestMessages) : 0);
+  const completionTokens = usageMetadata
+    ? (usageMetadata.candidatesTokenCount ?? 0) + (usageMetadata.thoughtsTokenCount ?? 0)
+    : Math.ceil((content.length + JSON.stringify(toolCalls).length) / 4);
+  const totalTokens = usageMetadata?.totalTokenCount || promptTokens + completionTokens;
+
+  const usage: TokenUsage = {
+    provider: 'gemini',
+    model: '',
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    estimated: !usageMetadata,
+    timestamp: Date.now(),
+  };
+
+  callbacks.onComplete(content, usage);
+  return { content, usage, toolCallCount: toolCalls.length, toolCalls, finishReason };
 }
 
 /**
@@ -326,16 +671,32 @@ export async function callProvider(
         continue;
       }
 
-      const result = await executeProviderCall(
-        config, apiKey, apiUrl, messages, tools, callbacks, abortSignal, settings
-      );
+      // Gemini speaks its own REST dialect (contents/parts/functionCall), not
+      // the OpenAI chat-completions format. executeGeminiCall performs the
+      // translation and returns the same shape as executeProviderCall, so all
+      // downstream logic (refusal detection, empty-response handling, TPM) is
+      // provider-independent.
+      const geminiResult = config.provider === 'gemini'
+        ? await executeGeminiCall(config, apiKey, messages, tools, callbacks, buildAbortSignal(settings, abortSignal), settings)
+        : await executeProviderCall(
+            config, apiKey, apiUrl, messages, tools, callbacks, abortSignal, settings
+          );
+      const result = {
+        content: geminiResult.content,
+        usage: geminiResult.usage,
+        toolCallCount: geminiResult.toolCallCount,
+      };
 
       // Refusal check: the call technically succeeded (HTTP 200) but the model
       // declined to answer. Treat it like a failed attempt so the NEXT model
       // in the fallback chain answers the SAME request with the SAME message
       // history — already completed work (tool results, earlier steps) stays
       // part of the conversation and is NOT re-run from scratch.
-      if (detectRefusal(result.content)) {
+      // For Gemini a safety block shows up as finishReason=SAFETY/... (the text
+      // may be empty or truncated), which text-based detectRefusal cannot see.
+      const geminiBlocked = config.provider === 'gemini' &&
+        geminiFinishReasonRefusal((geminiResult as GeminiCallResult).finishReason);
+      if (geminiBlocked || detectRefusal(result.content)) {
         // The refusing model consumed budget; account for its real usage
         // before handing over to the fallback.
         tpmManager.recordUsage(config.provider, result.usage.totalTokens, reservationId);
@@ -452,6 +813,18 @@ export async function callProvider(
   }
 
   throw lastError || new Error('All models failed');
+}
+
+/**
+ * Build the abort signal enforcing settings.maxCallDuration, combined with the
+ * caller's own abort signal (Esc / "Abbrechen"). Shared by executeProviderCall
+ * and the Gemini path so both respect the same timeout semantics.
+ */
+function buildAbortSignal(settings: AppSettings, userSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(
+    Math.max(1000, settings.maxCallDuration || 120000)
+  );
+  return userSignal ? AbortSignal.any([userSignal, timeoutSignal]) : timeoutSignal;
 }
 
 async function executeProviderCall(
@@ -752,6 +1125,29 @@ export async function handleStreamingResponse(
 
 export async function testConnection(provider: string, apiKey: string, modelId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    // Gemini uses its own REST dialect + x-goog-api-key header — a minimal
+    // generateContent call verifies key and model in one request.
+    if (provider === 'gemini') {
+      const response = await fetch(buildGeminiRequestUrl(modelId, false), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: 'Hello, respond with just "OK".' }] }],
+          generationConfig: { maxOutputTokens: 10 },
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.text();
+        return { success: false, error: `${response.status}: ${body}` };
+      }
+
+      return { success: true };
+    }
+
     const url = getApiUrl(provider);
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
