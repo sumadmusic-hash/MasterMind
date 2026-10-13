@@ -349,7 +349,8 @@ export class ChatOrchestrator {
   private async runAgentLoop(
     settings: AppSettings,
     session: ChatSession,
-    callbacks: ChatOrchestratorCallbacks
+    callbacks: ChatOrchestratorCallbacks,
+    currentUserMessage?: string
   ): Promise<{ interruption?: { err: any; ctx: Parameters<ChatOrchestrator['persistInterruptedTurn']>[2] } } | void> {
     // user_memory (docs/fehlende-tools-mehr-macht.md Phase 1): the persisted
     // memory block is appended to the system prompt once per turn — every
@@ -363,13 +364,30 @@ export class ChatOrchestrator {
       if (memBlock) systemContent = `${SYSTEM_PROMPT}\n\n${memBlock}`;
     } catch { /* memory is best-effort */ }
     const messages = this.buildProviderMessages(session.messages, systemContent);
-    // Token saving: the tool catalogue (~29 tools ≈ 7k prompt tokens) is
+    // Token saving: the tool catalogue (~31 tools ≈ 7k prompt tokens) is
     // billed on EVERY provider call. Select only tools relevant to the
     // current question plus a small core set (web search + url fetch), so a
     // simple fact question doesn't pay for the entire registry. When the
     // model asks for an unselected tool later in the turn, the catalogue is
     // widened once (see the tool-call branch below).
-    const lastUserQuery = [...session.messages].reverse().find(m => m.role === 'user')?.content || '';
+    // The CURRENT user message must win: on resumeTurn() no new user message
+    // is appended, and a plain "last user message" lookup would then pick up
+    // an older query from the history — selecting the wrong tools and even
+    // applying that stale turn's simple-fact budget to the resumed task.
+    // Fallback for resumeTurn(): the ORIGINAL request is still identifiable
+    // because the replayed interrupted assistant message carries its tool
+    // calls — derive the query from those call arguments instead of guessing
+    // from arbitrary earlier user messages.
+    const lastUserQuery = (() => {
+      if (typeof userMessage === 'string' && userMessage.trim()) return userMessage;
+      const resumedToolCalls = [...session.messages].reverse()
+        .find(m => m.role === 'assistant' && (m.toolCalls?.length ?? 0) > 0)?.toolCalls;
+      if (resumedToolCalls) {
+        const q = resumedToolCalls.map(c => c.arguments?.query).find(v => typeof v === 'string' && v);
+        if (q) return q as string;
+      }
+      return [...session.messages].reverse().find(m => m.role === 'user')?.content ?? '';
+    })();
     // Simple fact question → cheap runtime path (see SIMPLE_QUERY_TOOL_BUDGET):
     // one search at most, and after it the model MUST answer from the result —
     // never from its stale training data. Complex queries keep the full budget.
