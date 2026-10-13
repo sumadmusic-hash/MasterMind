@@ -201,7 +201,12 @@ export class ChatOrchestrator {
     this.abortController = new AbortController();
     this.toolCallCount = 0;
     this.processedToolCalls = new Set();
-    this.maxToolSteps = settings.maxToolSteps;
+    // maxToolSteps comes from the UI/settings as a NUMBER, but sessions or
+    // settings persisted by older builds (or hand-edited configs) can carry it
+    // as a string. `for (step < "10")` with a numeric step silently never
+    // iterates — every message would then skip the agent loop entirely.
+    // Coerce defensively so the loop always sees a real number.
+    this.maxToolSteps = Number(settings.maxToolSteps) || 20;
 
     // Add user message (via immutable helper so React state updates and the
     // final persistence below always see the same, up-to-date session).
@@ -277,7 +282,9 @@ export class ChatOrchestrator {
     this.abortController = new AbortController();
     this.toolCallCount = 0;
     this.processedToolCalls = new Set();
-    this.maxToolSteps = settings.maxToolSteps;
+    // Same defensive numeric coercion as sendMessage() — a string maxToolSteps
+    // would make the agent loop never iterate.
+    this.maxToolSteps = Number(settings.maxToolSteps) || 20;
 
     const last = session.messages[session.messages.length - 1];
     if (!last || last.role !== 'assistant' || !last.content.includes(INTERRUPTED_SUFFIX)) {
@@ -625,6 +632,12 @@ export class ChatOrchestrator {
       // budget accounting below must count them — otherwise a model emitting
       // garbage could loop past the per-turn cap until maxToolSteps.
       let nonExecutedCalls = 0;
+      // Protocol ids of the calls in THIS step whose assistant announcement
+      // survives (executed or answered with a dedup/budget-skipped reply).
+      // Invalid/garbage calls and provider-duplicated ids get filtered out of
+      // the assistant message below so no tool_call is left without exactly
+      // one matching tool response (Groq rejects both directions with a 400).
+      const announcedIds = new Set<string>();
 
       for (const { raw: tc, id: preallocatedId } of resolvedToolCalls) {
         const callId = preallocatedId;
@@ -726,6 +739,14 @@ export class ChatOrchestrator {
         const priorCallId = seenToolSignatures.get(signature);
         if (priorCallId !== undefined) {
           deferredDedupReplies.push({ callId, signature });
+          // Charge the duplicate against the per-turn budget IMMEDIATELY. The
+          // step-level accounting below (`usedBudget = resolvedToolCalls.length`)
+          // counts every call of this step anyway — but a duplicate is detected
+          // mid-preparation and must already be visible to the budget trim that
+          // runs right after the loop: otherwise the trim's `callBudgetLeft`
+          // ignores the dedup-skipped calls and lets more tools execute than
+          // the configured per-turn cap allows.
+          this.toolCallCount++;
           continue;
         }
         seenToolSignatures.set(signature, callId);
@@ -833,19 +854,19 @@ export class ChatOrchestrator {
       // step (or earlier), so its result is available by now — replay it
       // instead of a bare hint. Fallback note keeps the protocol valid even if
       // the producing call itself failed before storing a result.
-      // NOTE: match on the TOOL NAME, not the raw call id: when the provider
-      // omits `tc.id`, the loop mints synthetic ids (`call_${turnCallIndex}`)
-      // that do NOT coincide with ToolResult.callId, so an id-based lookup
-      // would silently degrade every cross-step cached replay to a bare hint
-      // (the exact failure observed with Groq: repeated identical searches
-      // received no result back and the model re-issued them until the budget
-      // was exhausted). The signature maps each duplicate to the ORIGINAL
-      // call, whose toolId survives id normalization inside execute().
+      // Lookup strategy: map the signature to the id of the call that PRODUCED
+      // the result (`seenToolSignatures`), then find THAT call's actual result
+      // by matching `ToolResult.callId === originalCall.id`. Matching on the
+      // tool NAME alone would attribute the wrong payload whenever the same
+      // tool ran twice with different arguments in one turn (e.g. calculator
+      // "1+1" followed by "2+2": a name-based lookup replays 4 for the "1+1"
+      // duplicate). The id-based chain survives id normalization inside
+      // execute(): ToolResult.callId carries the pre-allocated protocol id of
+      // the producing call.
       for (const dup of deferredDedupReplies) {
         const priorCallId = seenToolSignatures.get(dup.signature);
-        const priorCall = priorCallId ? turnToolCalls.find(c => c.id === priorCallId) : undefined;
-        const priorResult = priorCall
-          ? [...turnToolResults].reverse().find(r => r.toolId === priorCall.toolId)
+        const priorResult = priorCallId
+          ? turnToolResults.find(r => r.callId === priorCallId)
           : undefined;
         const reply: ProviderMessage = {
           role: 'tool',
@@ -873,7 +894,14 @@ export class ChatOrchestrator {
       // duplicate call is still a full extra round-trip, so it must count
       // against the per-turn budget; otherwise models that repeat identical
       // calls could loop past the cap until maxToolSteps.
-      const usedBudget = resolvedToolCalls.length;
+      // `resolvedToolCalls.length` covers every category: executed calls,
+      // dedup-skipped duplicates, budget-skipped trims and invalid/duplicate-
+      // id calls (see `nonExecutedCalls`). Dedup-skipped calls were ALREADY
+      // charged individually when detected (so the trim above saw them);
+      // subtract them here to avoid counting those calls TWICE — the very
+      // double-counting bug that made the budget trip after half as many
+      // calls as configured.
+      const usedBudget = resolvedToolCalls.length - deferredDedupReplies.length;
       this.toolCallCount += usedBudget;
       const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
