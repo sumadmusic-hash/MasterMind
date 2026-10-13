@@ -195,7 +195,7 @@ export class ChatOrchestrator {
   async sendMessage(
     settings: AppSettings,
     session: ChatSession,
-    userMessage?: string,
+    currentUserMessage?: string,
     callbacks: ChatOrchestratorCallbacks = NOOP_CALLBACKS
   ): Promise<void> {
     this.abortController = new AbortController();
@@ -205,18 +205,18 @@ export class ChatOrchestrator {
 
     // Add user message (via immutable helper so React state updates and the
     // final persistence below always see the same, up-to-date session).
-    // `userMessage` is optional: resumeTurn() reuses the existing session as-is.
-    if (userMessage !== undefined) {
+    // `currentUserMessage` is optional: resumeTurn() reuses the existing session as-is.
+    if (currentUserMessage !== undefined) {
       this.appendMessage(session, {
         id: crypto.randomUUID(),
         role: 'user',
-        content: userMessage,
+        content: currentUserMessage,
         timestamp: Date.now(),
       });
     }
 
     try {
-      const loop = await this.runAgentLoop(settings, session, callbacks);
+      const loop = await this.runAgentLoop(settings, session, callbacks, currentUserMessage);
       // If the turn stopped because every model refused (or all failed), the
       // interruption is persisted WITH the completed work attached — a later
       // resumeTurn() continues from there instead of restarting the task.
@@ -379,7 +379,7 @@ export class ChatOrchestrator {
     // calls — derive the query from those call arguments instead of guessing
     // from arbitrary earlier user messages.
     const lastUserQuery = (() => {
-      if (typeof userMessage === 'string' && userMessage.trim()) return userMessage;
+      if (typeof currentUserMessage === 'string' && currentUserMessage.trim()) return currentUserMessage;
       const resumedToolCalls = [...session.messages].reverse()
         .find(m => m.role === 'assistant' && (m.toolCalls?.length ?? 0) > 0)?.toolCalls;
       if (resumedToolCalls) {
