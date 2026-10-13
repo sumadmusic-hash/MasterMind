@@ -711,7 +711,6 @@ export class ChatOrchestrator {
       const callBudgetLeft = Math.max(0, effectiveToolBudget - this.toolCallCount);
       if (pendingCalls.length > callBudgetLeft) {
         for (const dropped of pendingCalls.slice(callBudgetLeft)) {
-          stepSkippedIds.add(dropped.id);
           messages.push({
             role: 'tool',
             content: JSON.stringify({ skipped: 'Tool-Budget für diesen Turn erschöpft. Antworte jetzt mit dem gesammelten Material.' }),
