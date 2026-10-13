@@ -1,5 +1,5 @@
 import type { ModelConfig, ChatMessage, TokenUsage, AppSettings } from '../types';
-import { recordTokenUsage, addLog } from './database';
+import { recordTokenUsage, addLog, getSettings } from './database';
 import { tpmManager } from './tpm';
 
 export interface ProviderMessage {
@@ -45,6 +45,17 @@ const MODEL_CATALOGS: Record<string, { id: string; name: string; contextWindow: 
     { id: 'meta-llama/llama-3.1-70b-instruct', name: 'Llama 3.1 70B', contextWindow: 128000, supportsTools: true },
     { id: 'google/gemini-pro-1.5', name: 'Gemini Pro 1.5', contextWindow: 2000000, supportsTools: true },
     { id: 'mistralai/mixtral-8x7b-instruct', name: 'Mixtral 8x7B', contextWindow: 32768, supportsTools: true },
+  ],
+  // Lokale KI über LM Studio (https://lmstudio.ai): der "Developer Server"
+  // (Server-Tab → Start Server) stellt eine OpenAI-kompatible API auf
+  // http://localhost:1234/v1 bereit. Die tatsächlich geladenen Modelle hängen
+  // von der lokalen Installation ab — fetchLmStudioModels() liest sie live vom
+  // Server aus; die Liste hier ist nur ein Offline-Fallback mit gängigen ids.
+  lmstudio: [
+    { id: 'local-model', name: 'Lokales Modell (Standard-Placeholder)', contextWindow: 8192, supportsTools: true },
+    { id: 'meta-llama-3.1-8b-instruct', name: 'Llama 3.1 8B Instruct (lokal)', contextWindow: 131072, supportsTools: true },
+    { id: 'qwen2.5-coder-14b-instruct', name: 'Qwen 2.5 Coder 14B (lokal)', contextWindow: 32768, supportsTools: true },
+    { id: 'google-gemma-2-9b-it', name: 'Gemma 2 9B IT (lokal)', contextWindow: 8192, supportsTools: false },
   ],
   // Google Gemini API (AI Studio) — kostenlos nutzbar mit kostenlosem API-Key
   // von https://aistudio.google.com/apikey (Tier "Free", ohne Kreditkarte).
@@ -209,10 +220,41 @@ export function getAllModels() {
     groq: MODEL_CATALOGS.groq,
     openrouter: MODEL_CATALOGS.openrouter,
     gemini: MODEL_CATALOGS.gemini,
+    lmstudio: MODEL_CATALOGS.lmstudio,
   };
 }
 
-function getApiUrl(provider: string): string {
+/** Standard-Basis-URL des LM-Studio-Developers-Servers (OpenAI-kompatibel). */
+export const LMSTUDIO_DEFAULT_BASE_URL = 'http://localhost:1234/v1';
+
+/**
+ * Timeout-Budget für den ERSTEN Aufruf eines lokalen Modells pro Request.
+ * LM Studio lädt das GGUF-Modell beim ersten Request in RAM/VRAM ("kalter
+ * Start") — bei großen Modellen dauern allein die Vorlaufminuten länger als
+ * das globale maxCallDuration (Standard 120s). Einmalig erlaubt, danach ist
+ * das Modell warm und der normale Rahmen gilt wieder.
+ */
+const LOCAL_COLD_START_MAX_DURATION = 600000; // 10 Minuten
+
+/**
+ * Basis-URL des lokalen Servers aus den Einstellungen ableiten (Leer =
+ * Standard). Toleriert Varianten wie "http://localhost:1234" (ohne /v1),
+ * "https://192.168.x.x:1234/v1/" (Remote-LAN) oder einen beliebigen anderen
+ * OpenAI-kompatiblen lokalen Server (Ollama mit LM-Studio-Bridge, llama.cpp,
+ * vLLM …).
+ */
+export function getLmStudioBaseUrl(settings?: Pick<AppSettings, 'lmstudioBaseUrl'> | null): string {
+  const raw = String(settings?.lmstudioBaseUrl || '').trim().replace(/\/+$/, '');
+  if (!raw) return LMSTUDIO_DEFAULT_BASE_URL;
+  // Endpunkt-Pfade nie mitschleifen — wir bauen /chat/completions selbst an.
+  const withoutEndpoint = raw.replace(/\/(chat\/completions|completions|models)$/i, '');
+  // "/v1" ergänzen, wenn der Nutzer nur Host:Port angegeben hat (LM Studio &
+  // Co. erwarten den Pfad; reine Host-Angaben sind ein häufiger Tippfehler).
+  if (!/\/v\d+$/.test(withoutEndpoint)) return `${withoutEndpoint}/v1`;
+  return withoutEndpoint;
+}
+
+function getApiUrl(provider: string, settings?: AppSettings): string {
   switch (provider) {
     case 'groq': return 'https://api.groq.com/openai/v1/chat/completions';
     case 'openrouter': return 'https://openrouter.ai/api/v1/chat/completions';
@@ -220,6 +262,9 @@ function getApiUrl(provider: string): string {
     // bzw. :generateContent) — buildGeminiRequestUrl setzt sie zusammen. Der
     // Basis-Eintrag hier dient nur der "Provider bekannt"-Prüfung im Fallback-Loop.
     case 'gemini': return 'https://generativelanguage.googleapis.com/v1beta';
+    // Lokale KI (LM Studio): OpenAI-kompatibler chat/completions-Endpunkt auf
+    // dem konfigurierten lokalen Server (Standard http://localhost:1234/v1).
+    case 'lmstudio': return `${getLmStudioBaseUrl(settings)}/chat/completions`;
     default: throw new Error(`Unknown provider: ${provider}`);
   }
 }
@@ -229,7 +274,70 @@ function getApiKey(settings: AppSettings, provider: string): string | undefined 
     case 'groq': return settings.groqApiKey;
     case 'openrouter': return settings.openRouterApiKey;
     case 'gemini': return settings.geminiApiKey;
+    // LM Studio verlangt standardmäßig KEINEN Key — lokale Modelle laufen ohne
+    // Registrierung. Ein optionaler settings.lmstudioApiKey erlaubt Server, die
+    // doch einen erwarten. Ist beides leer, senden wir einen Füllwert ("local"),
+    // damit der Provider im Fallback-Loop trotzdem als "konfiguriert" gilt und
+    // nicht wegen eines fehlenden Keys übersprungen wird.
+    case 'lmstudio': return settings.lmstudioApiKey?.trim() || 'local';
     default: return undefined;
+  }
+}
+
+// ============ LM Studio (lokale KI) ============
+//
+// LM Studio (https://lmstudio.ai) stellt über seinen "Developer Server" eine
+// OpenAI-kompatible REST-API bereit (Standard: http://localhost:1234/v1).
+// Requests laufen komplett lokal — es werden keine Daten an Cloud-Anbieter
+// gesendet und es fallen keine API-Kosten an. Das Format ist identisch zu
+// Groq/OpenRouter (chat/completions + SSE-Streaming + tool_calls), daher reuse
+// executeProviderCall; nur die URL- und Key-Auflösung unterscheidet sich.
+
+/**
+ * Live-Liste der beim lokalen Server verfügbaren Modelle (GET /v1/models).
+ * Schlägt der Server nicht erreichbar fehl, kommt eine leere Liste zurück —
+ * Aufrufer können dann auf MODEL_CATALOGS.lmstudio zurückgreifen.
+ */
+export async function fetchLmStudioModels(baseUrl?: string): Promise<string[]> {
+  try {
+    const response = await fetch(`${getLmStudioBaseUrl({ lmstudioBaseUrl: baseUrl })}/models`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) return [];
+    const data = await response.json().catch(() => null);
+    const models = Array.isArray(data?.data) ? data.data : [];
+    return models.map((m: any) => String(m?.id || '')).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Erreichbarkeit + Modell-Liste des lokalen Servers prüfen (für Settings-UI).
+ * Unterscheidet sauber zwischen "Server läuft nicht" (CORS-/Netzwerkfehler →
+ * typischerweise TypeError "Failed to fetch") und HTTP-Fehlern.
+ */
+export async function checkLmStudioServer(baseUrl?: string): Promise<{ success: boolean; models: string[]; error?: string }> {
+  const url = `${getLmStudioBaseUrl({ lmstudioBaseUrl: baseUrl })}/models`;
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (!response.ok) {
+      return { success: false, models: [], error: `HTTP ${response.status} von ${url}` };
+    }
+    const data = await response.json().catch(() => null);
+    const models = (Array.isArray(data?.data) ? data.data : [])
+      .map((m: any) => String(m?.id || ''))
+      .filter(Boolean);
+    if (models.length === 0) {
+      return { success: true, models: [], error: 'Server erreichbar, aber kein Modell geladen — bitte in LM Studio ein Modell laden.' };
+    }
+    return { success: true, models };
+  } catch (err: any) {
+    return {
+      success: false,
+      models: [],
+      error: `LM Studio nicht erreichbar (${url}). Developer-Server öffnen: LM Studio → Tab „Developer“ → „Start Server“ (CORS aktiviert lassen).`,
+    };
   }
 }
 
@@ -631,6 +739,13 @@ export async function callProvider(
   ].filter((m): m is ModelConfig => !!m);
 
   let lastError: Error | null = null;
+  // Lokale Modelle (LM Studio) laden beim ersten Request oft sekundenlang die
+  // Gewichte in den RAM/VRAM — dieser "kalte Start" schlägt regelmäßig gegen
+  // das globale maxCallDuration-Timeout (Standard 120s), obwohl der Server
+  // perfectly gesund ist. Wir erlauben einmalig ein deutlich längeres Budget
+  // für das erste lmstudio-Slot, das den Timeout tatsächlich auslöst. Danach
+  // bleibt das Modell im Speicher und antwortet schnell.
+  let localColdStartAllowed = false;
   // Refusal tracking: if EVERY model in the chain refused the request (content
   // policy) instead of failing technically, the caller should be able to tell
   // "all models declined" apart from "all models errored" — and must NOT treat
@@ -664,7 +779,7 @@ export async function callProvider(
     }
     let apiUrl: string;
     try {
-      apiUrl = getApiUrl(config.provider);
+      apiUrl = getApiUrl(config.provider, settings);
     } catch (err: any) {
       lastError = err;
       if (!seenConfigErrors.has(err.message)) {
@@ -690,20 +805,28 @@ export async function callProvider(
       // can release/confirm exactly THIS reservation later — previously the id
       // was discarded and error paths released an arbitrary (oldest) provider
       // reservation, which could free a concurrent request's pending budget.
+      // AUSNAHME lmstudio (lokale KI): Lokale Modelle verursachen KEINE API-
+      // Kosten und werden nicht von Anbieter-Rate-Limits gedrosselt — ihr
+      // Durchsatz ergibt sich aus der Hardware. Sie würden durch das globale
+      // TPM-Budget unnötig blockiert (Reservierung schlägt bei großen Prompts
+      // z. B. permanent fehl). Token-Verbrauch wird trotzdem weiter protokolliert.
+      const isLocalProvider = config.provider === 'lmstudio';
       const estimatedTokens = estimateTokens(messages);
       const maxOutput = settings.maxTokensPerRequest;
       const totalEstimated = estimatedTokens + maxOutput;
 
-      reservationId = await tpmManager.reserveAndWait(config.provider, totalEstimated, settings, {
-        signal: abortSignal,
-        onWait: (waitMs, waitedMs) => callbacks?.onBudgetWait?.(waitMs, waitedMs),
-      });
-      if (!reservationId) {
-        // Budget stays configurable via Settings; this only happens when the
-        // wait window elapsed, the request can never fit the limits, or the
-        // user aborted while waiting.
-        lastError = new Error(`Token budget (${settings.globalTpmLimit.toLocaleString()} TPM) still exhausted after waiting — try again later or raise the limit in Settings.`);
-        continue;
+      if (!isLocalProvider) {
+        reservationId = await tpmManager.reserveAndWait(config.provider, totalEstimated, settings, {
+          signal: abortSignal,
+          onWait: (waitMs, waitedMs) => callbacks?.onBudgetWait?.(waitMs, waitedMs),
+        });
+        if (!reservationId) {
+          // Budget stays configurable via Settings; this only happens when the
+          // wait window elapsed, the request can never fit the limits, or the
+          // user aborted while waiting.
+          lastError = new Error(`Token budget (${settings.globalTpmLimit.toLocaleString()} TPM) still exhausted after waiting — try again later or raise the limit in Settings.`);
+          continue;
+        }
       }
 
       // Gemini speaks its own REST dialect (contents/parts/functionCall), not
@@ -711,10 +834,20 @@ export async function callProvider(
       // translation and returns the same shape as executeProviderCall, so all
       // downstream logic (refusal detection, empty-response handling, TPM) is
       // provider-independent.
+      // Gemini spricht NICHT das OpenAI-Format, sondern ein eigenes REST-API —
+      // executeGeminiCall übersetzt. Lokale LM-Studio-Server sprechen dagegen
+      // exakt das OpenAI-Format (chat/completions inkl. SSE + tool_calls) und
+      // laufen deshalb über den normalen executeProviderCall-Pfad; einzige
+      // Besonderheit: kalter Modell-Start bekommt einmalig mehr Zeitfenster.
+      const localExtendedTimeout =
+        config.provider === 'lmstudio' && !localColdStartAllowed;
+      if (localExtendedTimeout) localColdStartAllowed = true;
+
       const geminiResult = config.provider === 'gemini'
         ? await executeGeminiCall(config, apiKey, messages, tools, callbacks, buildAbortSignal(settings, abortSignal), settings)
         : await executeProviderCall(
-            config, apiKey, apiUrl, messages, tools, callbacks, abortSignal, settings
+            config, apiKey, apiUrl, messages, tools, callbacks, abortSignal, settings,
+            localExtendedTimeout
           );
       const result = {
         content: geminiResult.content,
@@ -885,7 +1018,10 @@ async function executeProviderCall(
   tools: any[] | undefined,
   callbacks: StreamCallbacks | undefined,
   abortSignal: AbortSignal | undefined,
-  settings: AppSettings
+  settings: AppSettings,
+  /** LM Studio (lokaler Server): längeres Timeout für den kalten Start des
+   *  ersten lokalen Aufrufs (Modell wird in RAM/VRAM geladen). */
+  extendedTimeout = false
 ): Promise<{ content: string; usage: TokenUsage; toolCallCount: number }> {
   // NOTE: the request URL is resolved by the caller (callProvider) BEFORE the
   // TPM reservation — an unknown provider must fail fast without ever
@@ -936,14 +1072,27 @@ async function executeProviderCall(
     headers['X-Title'] = 'AI Research Assistant';
   }
 
+  // LM Studio & die meisten lokalen Server ignorieren den Authorization-Header;
+  // weglassen schadet nie und vermeidet Verwirrung, falls der Nutzer keinen
+  // Key gesetzt hat (der Füllwert "local" würde sonst als echter Key aussehen).
+  if (config.provider === 'lmstudio' && !String(settings.lmstudioApiKey || '').trim()) {
+    delete headers['Authorization'];
+  }
+
   // Enforce settings.maxCallDuration: previously this value was persisted and
   // shown in Settings but never applied — a hung provider request (or a stream
   // that stalls mid-response) would block the agent loop indefinitely. Combine
   // the caller's abort signal with a per-call timeout signal so BOTH user aborts
   // (Esc / "Abbrechen") and the timeout cancel the fetch. AbortError keeps its
   // name, so callProvider's `err.name === 'AbortError'` rethrow still works.
+  // Lokale Server (LM Studio) bekommen beim kalten Start ein deutlich längeres
+  // Budget: das Entladen des Modells in RAM/VRAM kann mehrere Minuten dauern,
+  // obwohl der Server gesund ist (extendedTimeout, einmalig pro Request).
+  const effectiveMaxCallDuration = extendedTimeout
+    ? Math.max(settings.maxCallDuration || 120000, LOCAL_COLD_START_MAX_DURATION)
+    : settings.maxCallDuration;
   const timeoutSignal = AbortSignal.timeout(
-    Math.max(1000, settings.maxCallDuration || 120000)
+    Math.max(1000, effectiveMaxCallDuration || 120000)
   );
   const combinedSignal = abortSignal
     ? AbortSignal.any([abortSignal, timeoutSignal])
@@ -960,10 +1109,22 @@ async function executeProviderCall(
   } catch (err: any) {
     if (timeoutSignal.aborted && !abortSignal?.aborted) {
       const tErr = new Error(
-        `Modell-Aufruf nach ${settings.maxCallDuration}ms abgebrochen (maxCallDuration überschritten).`
+        `Modell-Aufruf nach ${effectiveMaxCallDuration}ms abgebrochen (maxCallDuration überschritten).`
       );
       tErr.name = 'TimeoutError';
       throw tErr;
+    }
+    // LM Studio läuft nicht / Server gestoppt → fetch schlägt mit einem
+    // Netzwerkfehler (meist TypeError "Failed to fetch") fehl — aber nur, wenn
+    // der Nutzer den Aufruf nicht selbst abgebrochen hat (echter AbortError).
+    if (config.provider === 'lmstudio' && err?.name !== 'AbortError') {
+      const hint: any = new Error(
+        `LM Studio ist nicht erreichbar (${url}). Developer-Server starten: LM Studio → Tab „Developer“ → „Start Server“. ` +
+        `Falls ein anderer Port/IP genutzt wird, in den Einstellungen unter „Lokale KI (LM Studio)“ anpassen. Ursprünglicher Fehler: ${err.message || err.name}`
+      );
+      hint.name = 'LocalServerUnavailable';
+      hint.status = 503;
+      throw hint;
     }
     throw err;
   }
@@ -1175,6 +1336,23 @@ export async function handleStreamingResponse(
 
 export async function testConnection(provider: string, apiKey: string, modelId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    // LM Studio (lokale KI): kein API-Key nötig — geprüft wird die Erreichbar-
+    // keit des lokalen Servers. Das `apiKey`-Argument wird hier als optionale
+    // Basis-URL interpretiert (Leer = Standard http://localhost:1234/v1), damit
+    // das Settings-UI denselben Test-Knopf wie bei den Cloud-Providern nutzen kann.
+    if (provider === 'lmstudio') {
+      const check = await checkLmStudioServer(String(apiKey || '').trim());
+      if (!check.success) return { success: false, error: check.error };
+      if (check.models.length === 0) return { success: false, error: check.error };
+      if (modelId && !check.models.includes(modelId)) {
+        return {
+          success: false,
+          error: `Server erreichbar, aber Modell "${modelId}" ist nicht geladen. Verfügbar: ${check.models.slice(0, 6).join(', ')}${check.models.length > 6 ? ' …' : ''}`,
+        };
+      }
+      return { success: true };
+    }
+
     // Gemini uses its own REST dialect + x-goog-api-key header — a minimal
     // generateContent call verifies key and model in one request.
     if (provider === 'gemini') {
@@ -1207,6 +1385,8 @@ export async function testConnection(provider: string, apiKey: string, modelId: 
       return { success: true };
     }
 
+    // lmstudio wurde oben bereits über checkLmStudioServer behandelt — hier
+    // erreichen wir den Cloud-Pfad nur noch für groq/openrouter.
     const url = getApiUrl(provider);
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',

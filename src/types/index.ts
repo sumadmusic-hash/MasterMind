@@ -1,7 +1,10 @@
 import { z } from 'zod';
 
 // ============ Provider Types ============
-export const ProviderSchema = z.enum(['groq', 'openrouter', 'gemini']);
+// 'lmstudio' = lokale KI über LM Studio (https://lmstudio.ai): dessen "Developer
+// Server" (Server-Tab → Start Server) exposingt eine OpenAI-kompatible API auf
+// http://localhost:1234/v1 — ohne API-Key, Modelle laufen komplett lokal.
+export const ProviderSchema = z.enum(['groq', 'openrouter', 'gemini', 'lmstudio']);
 export type Provider = z.infer<typeof ProviderSchema>;
 
 export const ModelConfigSchema = z.object({
@@ -17,6 +20,13 @@ export const AppSettingsSchema = z.object({
   // Google Gemini API (AI Studio): kostenloser API-Key (https://aistudio.google.com/apikey).
   // Wird nur lokal in IndexedDB gespeichert und direkt an generativelanguage.googleapis.com gesendet.
   geminiApiKey: z.string().optional(),
+  // LM Studio (lokale KI): Basis-URL des lokalen OpenAI-kompatiblen Servers.
+  // Standard http://localhost:1234/v1 (Developer Server in LM Studio starten).
+  // Leer = Standardwert. Nur lokal gespeichert; Daten verlassen den Rechner nicht.
+  lmstudioBaseUrl: z.string().optional(),
+  // Optionaler API-Key für lokale Server, die einen erwarten (LM Studio braucht
+  // standardmäßig keinen — dort wird ein Füllwert gesendet).
+  lmstudioApiKey: z.string().optional(),
   // Webz.io News API (https://app.webz.io/): Token für das webz_news-Tool.
   // Wird nur lokal in IndexedDB gespeichert und direkt an api.webz.io gesendet.
   webzApiToken: z.string().optional(),
