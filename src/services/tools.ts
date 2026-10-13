@@ -518,7 +518,13 @@ export function compactToolData(data: any, maxStringLen = 200, maxArrayLen = 8):
   }
   if (data && typeof data === 'object') {
     const out: Record<string, any> = {};
+    // Felder, die das Modell NIE braucht und die sonst als Prompt-Tokens auf
+    // JEDEM Agent-Schritt mitgewandert wären. "callId" wird vom Loop nur für
+    // das Caching interner Tool-Ergebnisse benutzt (turnToolResults) — es im
+    // Replay an das Modell zu senden, ist reine Token-Verschwendung.
+    const DROP_KEYS = new Set(['callId', 'timestamp']);
     for (const [k, v] of Object.entries(data)) {
+      if (DROP_KEYS.has(k)) continue;
       // Sonderbehandlung "chart": der validierte Chart-Spec von chart_spec
       // wird von ChatPage direkt gerendert (lazy recharts). series/categories
       // sind bereits hart auf 120 Punkte begrenzt; die generische Kürzung
