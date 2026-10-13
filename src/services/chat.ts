@@ -828,6 +828,13 @@ export class ChatOrchestrator {
       // Budget exhausted: force synthesis in the NEXT provider call. Without
       // this nudge the model tends to emit yet another tool-call step that
       // gets fully skipped — a wasted round-trip billing the whole history.
+      // NOTE: count ALL calls that consumed budget this turn (executed,
+      // dedup-skipped and budget-skipped) — not just the executed ones. A
+      // duplicate call is still a full extra round-trip, so it must count
+      // against the per-turn budget; otherwise models that repeat identical
+      // calls could loop past the cap until maxToolSteps.
+      const usedBudget = resolvedToolCalls.length - pendingCalls.length + deferredDedupReplies.length;
+      this.toolCallCount += usedBudget;
       const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
         messages.push({
