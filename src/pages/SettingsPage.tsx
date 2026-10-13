@@ -14,6 +14,7 @@ export function SettingsPage() {
   
   const [showGroqKey, setShowGroqKey] = useState(false);
   const [showOpenRouterKey, setShowOpenRouterKey] = useState(false);
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
   const [showWebzToken, setShowWebzToken] = useState(false);
   const [testingWebz, setTestingWebz] = useState(false);
   const [webzTestResult, setWebzTestResult] = useState<{ success: boolean; error?: string } | null>(null);
@@ -31,9 +32,13 @@ export function SettingsPage() {
     setTestingProvider(provider);
     setTestResult(null);
     
-    const apiKey = provider === 'groq' ? settings.groqApiKey : settings.openRouterApiKey;
+    const apiKey = provider === 'groq' ? settings.groqApiKey
+      : provider === 'gemini' ? settings.geminiApiKey
+      : settings.openRouterApiKey;
     const modelId = provider === 'groq' 
       ? (settings.primaryModel.provider === 'groq' ? settings.primaryModel.modelId : 'llama-3.3-70b-versatile')
+      : provider === 'gemini'
+      ? (settings.primaryModel.provider === 'gemini' ? settings.primaryModel.modelId : 'gemini-2.5-flash')
       : (settings.primaryModel.provider === 'openrouter' ? settings.primaryModel.modelId : 'openai/gpt-4o-mini');
 
     if (!apiKey) {
@@ -217,6 +222,46 @@ export function SettingsPage() {
                 </button>
               </div>
               {testResult?.provider === 'openrouter' && (
+                <div className={`flex items-center gap-1 mt-1 text-xs ${testResult.success ? 'text-green-400' : 'text-red-400'}`}>
+                  {testResult.success ? <Check className="w-3 h-3" /> : <X className="w-3 h-3" />}
+                  {testResult.success ? 'Connection successful' : testResult.error}
+                </div>
+              )}
+            </div>
+
+            {/* Google Gemini (kostenloser API-Key via AI Studio) */}
+            <div>
+              <label className="text-sm text-gray-400 mb-1 block">Google Gemini API Key (kostenlos)</label>
+              <div className="flex gap-2">
+                <div className="flex-1 relative">
+                  <input
+                    type={showGeminiKey ? 'text' : 'password'}
+                    value={settings.geminiApiKey || ''}
+                    onChange={e => updateSettings({ geminiApiKey: e.target.value })}
+                    placeholder="AIza..."
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    onClick={() => setShowGeminiKey(!showGeminiKey)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                  >
+                    {showGeminiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <button
+                  onClick={() => handleTestConnection('gemini')}
+                  disabled={testingProvider === 'gemini'}
+                  className="px-3 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-sm text-gray-300 transition-colors disabled:opacity-50"
+                >
+                  {testingProvider === 'gemini' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Test'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Kostenloser Key von https://aistudio.google.com/apikey (ohne Kreditkarte). Free-Tier für
+                Gemini 2.5 Flash: ca. 15 Anfragen/Min. und 1500/Tag. Als Primär- oder Fallback-Modell nutzbar;
+                der Key wird nur lokal gespeichert und direkt an die Google-API gesendet.
+              </p>
+              {testResult?.provider === 'gemini' && (
                 <div className={`flex items-center gap-1 mt-1 text-xs ${testResult.success ? 'text-green-400' : 'text-red-400'}`}>
                   {testResult.success ? <Check className="w-3 h-3" /> : <X className="w-3 h-3" />}
                   {testResult.success ? 'Connection successful' : testResult.error}
@@ -548,12 +593,17 @@ function ModelSelector({ label, config, onChange, optional }: {
         >
           <option value="groq">Groq</option>
           <option value="openrouter">OpenRouter</option>
+          <option value="gemini">Google Gemini (kostenlos)</option>
         </select>
         <input
           type="text"
           value={config?.modelId || ''}
           onChange={e => onChange({ ...config, modelId: e.target.value })}
-          placeholder={config?.provider === 'openrouter' ? 'z. B. openai/gpt-4o-mini' : 'z. B. llama-3.3-70b-versatile'}
+          placeholder={
+            config?.provider === 'openrouter' ? 'z. B. openai/gpt-4o-mini'
+            : config?.provider === 'gemini' ? 'z. B. gemini-2.5-flash'
+            : 'z. B. llama-3.3-70b-versatile'
+          }
           className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:outline-none focus:border-blue-500"
         />
       </div>

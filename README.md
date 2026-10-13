@@ -6,7 +6,7 @@ A modular, extensible AI-powered research web application with chat, tool orches
 
 ### Core Capabilities
 - **Chat Interface**: Full conversational AI with streaming responses, tool call visibility, and source citations
-- **Multi-Provider Support**: Groq and OpenRouter with 7 configurable model slots (primary + 6 fallbacks)
+- **Multi-Provider Support**: Groq, OpenRouter and Google Gemini (free API key via [AI Studio](https://aistudio.google.com/apikey), no credit card required) with 7 configurable model slots (primary + 6 fallbacks)
 - **Automatic Fallback**: Intelligent failover between models on errors, rate limits, server issues — or content refusals (detected in English and German replies; the fallback model takes over the same conversation with its full working state)
 - **Resume Interrupted Turns („Fortsetzen")**: If a turn is interrupted (all models refused, or an infrastructure error occurred mid-task), completed steps, tool calls and tool results are persisted; the „Fortsetzen" button continues exactly where the run stopped instead of restarting it
 - **Token Budget Management (TPM)**: Server-side token-per-minute control with reservation system for parallel requests

@@ -16,6 +16,14 @@ describe('Provider Service', () => {
     expect(models.length).toBeGreaterThan(0);
   });
 
+  it('should return Gemini model catalog (free Google AI Studio API)', () => {
+    const models = getModelCatalog('gemini');
+    expect(models.length).toBeGreaterThan(0);
+    const flash = models.find(m => m.id === 'gemini-2.5-flash');
+    expect(flash).toBeDefined();
+    expect(flash?.supportsTools).toBe(true);
+  });
+
   it('should return empty for unknown provider', () => {
     const models = getModelCatalog('unknown');
     expect(models).toEqual([]);
@@ -25,8 +33,10 @@ describe('Provider Service', () => {
     const all = getAllModels();
     expect(all).toHaveProperty('groq');
     expect(all).toHaveProperty('openrouter');
+    expect(all).toHaveProperty('gemini');
     expect(all.groq.length).toBeGreaterThan(0);
     expect(all.openrouter.length).toBeGreaterThan(0);
+    expect(all.gemini.length).toBeGreaterThan(0);
   });
 
   it('should have Llama 3.3 70B in Groq models', () => {
