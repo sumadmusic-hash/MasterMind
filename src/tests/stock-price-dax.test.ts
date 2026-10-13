@@ -6,7 +6,11 @@ const exec = (toolId: string, args: any) =>
 
 describe('stock_price: DAX-Abfrage (Bug „HTML-Fehler“)', () => {
   beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.restoreAllMocks());
+  // `vi.stubGlobal` installs globals on the global object — restoreAllMocks()
+  // does NOT undo them, so the HTML-error fetch mock leaked into every later
+  // test in this file (the stock_analysis case ran against the stale 429 mock
+  // and failed). unstubAllGlobals() returns `fetch` to its original value.
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
   it('liefert einen Kurs, wenn Yahoo korrekt antwortet', async () => {
     const r: any = await exec('stock_price', { ticker: 'DAX' });
