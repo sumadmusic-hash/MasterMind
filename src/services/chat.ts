@@ -35,8 +35,12 @@ const SIMPLE_QUERY_TOOL_BUDGET = 1;
 export function isSimpleFactQuery(text: string): boolean {
   const q = (text || '').trim().toLowerCase();
   if (!q) return false;
+  // The cheap path only makes sense for INTERROGATIVE one-fact questions —
+  // imperative task descriptions ("rechne 1+0, 2+0 … aus", "nenne mir …") may
+  // contain question marks in quotes but demand multiple computations.
+  if (/^(?:rechne|berechne|nenne|gib|liste|mach|mache|zeig|calc|addier)/.test(q)) return false;
   // Long inputs are compound tasks / pasted content, not a quick fact lookup.
-  if (q.length > 120) return false;
+  if (q.length > 80) return false;
   // Imperatives & research vocabulary → full task, keep normal budget.
   if (/(?:^|\s)(?:recherchiere|research|analysier|untersuch|vergleiche|erstelle|berichte|zusammenfassen|fasse .{0,20} zusammen|erkl[aä]re .{0,30}(gründlich|detailliert|ausführlich)|step[- ]?by[- ]?step|pro |studie|report)/.test(q)) return false;
   // Question words typical for one-fact lookups…
@@ -625,24 +629,24 @@ export class ChatOrchestrator {
       // stock, URL fetch) previously ran one after another, so a step with
       // several calls took the SUM of their latencies instead of the maximum.
       const pendingCalls: ToolCall[] = [];
+      // Protocol ids of the calls that pass validation and are queued for
+      // execution in THIS step — BEFORE the budget trim shrinks the queue.
+      // The deferred-dedup charge below must only count duplicates whose
+      // producing call ran in an EARLIER step; a duplicate whose producer is
+      // queued here shares one execution with it and the whole group is
+      // charged once via `usedBudget` at the end of the step. Using
+      // `pendingCalls` for that check instead of this set is wrong whenever
+      // the trim drops the producer from the queue (budget-skipped producers
+      // were never executed, so their duplicates must be charged).
+      const queuedCallIds = new Set<string>();
       // Duplicate calls detected in this step; their tool messages are pushed
       // after the parallel execution so they can replay the real result.
       const deferredDedupReplies: { callId: string; signature: string }[] = [];
-      // Calls that never reach execution (invalid payload, duplicate id). The
-      // budget accounting below must count them — otherwise a model emitting
-      // garbage could loop past the per-turn cap until maxToolSteps.
-      let nonExecutedCalls = 0;
       // Protocol ids of invalid/garbage calls. They were already charged to
       // `toolCallCount` individually when detected (so the budget trim right
       // after the prepare loop sees them); the step-end accounting must not
       // count them a second time.
       const invalidCallIds = new Set<string>();
-      // Protocol ids of the calls in THIS step whose assistant announcement
-      // survives (executed or answered with a dedup/budget-skipped reply).
-      // Invalid/garbage calls and provider-duplicated ids get filtered out of
-      // the assistant message below so no tool_call is left without exactly
-      // one matching tool response (Groq rejects both directions with a 400).
-      const announcedIds = new Set<string>();
 
       for (const { raw: tc, id: preallocatedId } of resolvedToolCalls) {
         const callId = preallocatedId;
@@ -654,9 +658,10 @@ export class ChatOrchestrator {
         // TWO tool responses under one tool_call into the prompt and Groq
         // rejects that with a 400 ("tool message without preceding tool
         // call"). Such calls are dropped from the assistant message as well
-        // (see the `announced` filter below) and only charged to the budget.
+        // (see the retainedReplyIds filter below); the original call of that
+        // id was already charged when it was prepared, so this stray repeat
+        // consumes no additional budget.
         if (this.processedToolCalls.has(callId)) {
-          nonExecutedCalls++;
           continue;
         }
         this.processedToolCalls.add(callId);
@@ -696,7 +701,6 @@ export class ChatOrchestrator {
           // `processedToolCalls` above, so the step-end accounting must NOT
           // count this call again — it is tracked in `invalidCallIds` and
           // subtracted there.
-          nonExecutedCalls++;
           invalidCallIds.add(callId);
           this.toolCallCount++;
           messages.push({
@@ -760,13 +764,14 @@ export class ChatOrchestrator {
           // loop (`usedBudget` counts executed + budget-skipped); incrementing
           // here as well would count that pair TWICE and trip the budget after
           // half as many real executions as configured.
-          if (!pendingCalls.some(c => c.id === priorCallId)) {
+          if (!queuedCallIds.has(priorCallId)) {
             this.toolCallCount++;
           }
           continue;
         }
         seenToolSignatures.set(signature, callId);
 
+        queuedCallIds.add(callId);
         pendingCalls.push(toolCall);
       }
 
@@ -779,6 +784,17 @@ export class ChatOrchestrator {
       // onToolCall: the callback signals actual EXECUTION, so budget-skipped
       // calls must never be reported as started (previously the UI/telemetry
       // showed every queued call as running even though most were skipped).
+      // `stepToolMessages` collects every tool reply generated for THIS step
+      // (executed results + dedup replays) and is appended to `messages` only
+      // after the parallel execution, in original call order (Groq rejects
+      // out-of-order tool responses with a 400). `stepToolMessagesByCall`
+      // keeps each reply addressable by its protocol id so the budget-trim
+      // below can remove exactly the messages of dropped calls while
+      // preserving the original ordering. The map is created BEFORE the trim
+      // because budget-skip notes are registered there as well.
+      const stepToolMessages: ProviderMessage[] = [];
+      const stepToolMessagesByCall = new Map<string, ProviderMessage>();
+
       const callBudgetLeft = Math.max(0, effectiveToolBudget - this.toolCallCount);
       // Protocol ids of calls trimmed by the per-turn budget. Their "skipped"
       // tool replies stay in the conversation (the announcement stays too —
@@ -790,11 +806,16 @@ export class ChatOrchestrator {
       if (pendingCalls.length > callBudgetLeft) {
         for (const dropped of pendingCalls.slice(callBudgetLeft)) {
           budgetSkippedIds.add(dropped.id);
-          messages.push({
+          const skipNote: ProviderMessage = {
             role: 'tool',
             content: JSON.stringify({ skipped: 'Tool-Budget für diesen Turn erschöpft. Antworte jetzt mit dem gesammelten Material.' }),
             tool_call_id: dropped.id,
-          });
+          };
+          messages.push(skipNote);
+          // Register it like every other reply of this step so the protocol
+          // cleanup at the end of the step knows this message belongs to the
+          // current assistant announcement (ordering/trim invariant).
+          stepToolMessagesByCall.set(dropped.id, skipNote);
           callbacks.onToolResult({ callId: dropped.id, toolId: dropped.toolId, success: false, error: 'Tool-Budget für diesen Turn erschöpft', duration: 0, timestamp: Date.now() });
         }
         pendingCalls.length = callBudgetLeft;
@@ -802,18 +823,6 @@ export class ChatOrchestrator {
 
       // Announce the surviving calls now that the budget trim is settled.
       for (const c of pendingCalls) callbacks.onToolCall(c);
-
-      // Protocol invariant: EVERY tool_call in the assistant message needs a
-      // matching tool message. Invalid/duplicate/budget-skipped calls got
-      // theirs immediately; deferred duplicates and executed calls are next —
-      // build all replies first, then push in ORIGINAL call order so the
-      // assistant tool_calls and tool messages stay aligned (Groq rejects
-      // out-of-order tool responses with a 400).
-      // `stepToolMessagesByCall` keeps each reply addressable by its protocol
-      // id so the budget-trim at the end of this step can remove exactly the
-      // messages of dropped calls while preserving the original ordering.
-      const stepToolMessages: ProviderMessage[] = [];
-      const stepToolMessagesByCall = new Map<string, ProviderMessage>();
 
       if (pendingCalls.length > 0) {
         callbacks.onStatus(
@@ -913,22 +922,26 @@ export class ChatOrchestrator {
       // Budget exhausted: force synthesis in the NEXT provider call. Without
       // this nudge the model tends to emit yet another tool-call step that
       // gets fully skipped — a wasted round-trip billing the whole history.
-      // NOTE: charge EXACTLY ONE budget unit per call that actually consumed
-      // one, never more. Every category is accounted for precisely once:
-      //  - executed calls            → counted here (pendingCalls),
-      //  - dedup-skipped duplicates  → already charged individually in the
-      //    prepare loop (so the trim above saw them) — excluded here,
-      //  - invalid/garbage calls     → already charged individually too
-      //    (`invalidCallIds`) — excluded here,
-      //  - provider-duplicate ids    → never charged (the original call of
-      //    that id was billed when it was prepared),
-      //  - budget-skipped trims      → counted via `budgetSkippedIds`.
-      // The previous formula (`resolvedToolCalls.length − dedups`) counted
-      // invalid and duplicate-id calls TWICE (once inline, once via the total)
-      // and treated every deferred dedup as free even when its producing call
-      // ran in an earlier step — so the budget tripped at the wrong moment and
-      // valid protocol replies were trimmed away.
-      const usedBudget = pendingCalls.length + budgetSkippedIds.size;
+      // Charge EXACTLY ONE budget unit per distinct signature that consumed
+      // budget this step. Categories:
+      //  - queued groups (executed OR budget-skipped after the trim): each
+      //    unique signature counts ONCE — several identical calls answered
+      //    from one execution must not multiply the charge, and a group whose
+      //    producer was trimmed still consumed a budget slot;
+      //  - cross-step dedup hits: charged individually in the prepare loop
+      //    (their producer's signature is no longer in this step's queue);
+      //  - invalid/garbage calls: charged individually (`invalidCallIds`);
+      //  - provider-duplicate ids: never charged (the original call of that
+      //    id was billed when it was prepared).
+      // Counting `resolvedToolCalls.length` instead (the old formula) charged
+      // invalid and duplicate-id calls TWICE and treated every deferred dedup
+      // as free even when its producing call ran in an earlier step — so the
+      // budget tripped at the wrong moment and valid protocol replies were
+      // trimmed away.
+      let usedBudget = budgetSkippedIds.size;
+      for (const c of pendingCalls) {
+        if (seenToolSignatures.get(`${c.toolId}:${JSON.stringify(c.arguments)}`) === c.id) usedBudget++;
+      }
       this.toolCallCount += usedBudget;
       const budgetExhausted = this.toolCallCount >= effectiveToolBudget;
       if (budgetExhausted) {
@@ -947,7 +960,7 @@ export class ChatOrchestrator {
           ...pendingCalls.map(c => c.id),   // executed → real result pushed
           ...budgetSkippedIds,              // trimmed → "skipped" note pushed
         ]);
-        assistantMsg.tool_calls = assistantMsg.tool_calls.filter(
+        assistantMsg.tool_calls = (assistantMsg.tool_calls || []).filter(
           (c: any) => retainedReplyIds.has(c.id) || invalidCallIds.has(c.id)
         );
         // Only scan THIS step's messages (assistant message onwards): older
