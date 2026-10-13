@@ -324,7 +324,14 @@ export class ChatOrchestrator {
       if (memBlock) systemContent = `${SYSTEM_PROMPT}\n\n${memBlock}`;
     } catch { /* memory is best-effort */ }
     const messages = this.buildProviderMessages(session.messages, systemContent);
-    const tools = toolRegistry.getToolDefinitionsForLLM();
+    // Token saving: the tool catalogue (~29 tools ≈ 7k prompt tokens) is
+    // billed on EVERY provider call. Select only tools relevant to the
+    // current question plus a small core set (web search + url fetch), so a
+    // simple fact question doesn't pay for the entire registry. When the
+    // model asks for an unselected tool later in the turn, the catalogue is
+    // widened once (see the tool-call branch below).
+    const lastUserQuery = [...session.messages].reverse().find(m => m.role === 'user')?.content || '';
+    let tools = toolRegistry.getToolDefinitionsForLLM(lastUserQuery);
     // Accumulates the FINAL answer text across steps. Previously it was reset
     // to '' at the end of every step, so when the max-steps limit was hit the
     // fallback message below always contained nothing but the boilerplate —
@@ -594,7 +601,7 @@ export class ChatOrchestrator {
             role: 'tool',
             content: JSON.stringify({
               error: !toolName
-                ? 'Ungültiger Tool-Aufruf: Der Tool-Name fehlt. Verfügbare Tools: ' + toolRegistry.getEnabledTools().map(t => t.id).join(', ')
+                ? 'Ungültiger Tool-Aufruf: Der Tool-Name fehlt. Verfügbare Tools: ' + toolRegistry.getEnabledToolIds().join(', ')
                 : malformedArgs && toolName
                   ? `Ungültige bzw. unvollständige Argumente für "${toolName}" (JSON konnte nicht geparst werden). Rufe das Tool erneut mit vollständigem JSON-Arguments-Objekt auf.`
                   : 'Ungültiger (leerer) Tool-Aufruf ohne Name und Argumente – ignoriert.',
@@ -602,6 +609,18 @@ export class ChatOrchestrator {
             tool_call_id: callId,
           });
           continue;
+        }
+
+        // Catalogue widening: the per-turn tool selection is keyword-based and
+        // can miss a tool the model legitimately needs (it only saw a subset
+        // of the registry in this request). If the requested tool EXISTS but
+        // was not offered, execute it anyway — refusing would waste a step and
+        // force a re-search — and widen the catalogue for the remaining calls
+        // of this turn so no further round-trip is needed.
+        if (tools.length > 0 && !tools.some(t => t.name === toolName)) {
+          if (toolRegistry.getTool(toolName)) {
+            tools = toolRegistry.getToolDefinitionsForLLM();
+          }
         }
 
         const toolCall: ToolCall = {

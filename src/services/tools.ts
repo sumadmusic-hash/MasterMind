@@ -142,6 +142,80 @@ export function validateToolArguments(
   return problems;
 }
 
+/**
+ * Keyword-based tool selection for the LLM tool catalogue (token saving).
+ *
+ * The full catalogue (~29 tools) costs roughly 7k prompt tokens and is sent
+ * with EVERY provider call — including every follow-up step of an agent loop.
+ * For a simple question like "wer ist friedrich merz?" that dwarfs the actual
+ * answer (~300 tokens) and inflated a single turn to ~20k tokens. This helper
+ * keeps only the tools plausibly relevant for the current user query plus a
+ * small always-on core set, so generic research still works.
+ *
+ * Pure function (no registry state) so it is unit-testable in isolation.
+ */
+const TOOL_CORE_IDS = ['ddg_web_search', 'url_fetch'];
+
+const TOOL_KEYWORDS: Record<string, string[]> = {
+  web_search: ['websearch', 'websuche', 'suche im web', 'search the web'],
+  news_search: ['news', 'nachricht', 'presse', 'headline', 'aktuelles'],
+  gnews_search: ['news', 'nachricht', 'presse', 'gnews'],
+  gnews_top_headlines: ['news', 'schlagzeile', 'headline', 'top story'],
+  weather_lookup: ['wetter', 'weather', 'temperatur', 'regen', 'prognose', 'sonne', 'grad'],
+  economic_calendar: ['wirtschaftskalender', 'economic calendar', 'cpi', 'arbeitsmarkt', 'zinssatz', 'ezb', 'fed ', 'inflation'],
+  translate_text: ['übersetz', 'translate', 'dolmetsch', 'sprache übersetzen'],
+  calculator: ['rechn', 'calculat', 'mathematik', 'quadratwurzel', 'prozent', 'formel'],
+  currency_convert: ['währung', 'currency', 'fx', 'euro', 'dollar', 'usd', 'eur', 'franken', 'devisen', 'wechselkurs'],
+  company_lookup: ['unternehmen', 'company', 'konzern', 'ticker', 'firma', 'ceo', 'vorstand'],
+  stock_price: ['aktie', 'stock', 'kurs', 'preis', 'dax', 'mdax', 'sdax', 'tecdax', 'divdax', '^gspc', 's&p', 'nasdaq', 'bitcoin', 'krypto', 'crypto', 'wertpapier', 'share'],
+  stock_analysis: ['aktie', 'stock', 'chart', 'analyse', 'trend', 'performance', 'volatil', 'rsi', 'macd', 'dax', 'bitcoin', 'krypto', 'crypto'],
+  data_filter: ['filtern', 'sortieren', 'dedup', 'daten filtern', 'liste filtern'],
+  text_summarize: ['zusammenfass', 'summary', 'summarize', 'fasse', 'kurzfass'],
+  generate_report: ['bericht', 'report', 'studie', 'research', 'recherch', 'analyse erstellen'],
+  memory_save: ['merk dir', 'merken', 'speicher dir', 'gedächtnis', 'memory', 'präferenz', 'prefere'],
+  memory_recall: ['erinnerst', 'erinnere', 'gedächtnis', 'memory', 'weißt du noch', 'weiss du noch'],
+  memory_forget: ['vergiss', 'vergesse', 'löschen aus dem gedächtnis', 'forget'],
+  macro_series: ['inflation', 'bip', 'gdp', 'arbeitslosigkeit', 'unemployment', 'zins', 'macro', 'fred', 'konjunktur'],
+  portfolio_update: ['depot', 'portfolio', 'position kaufen', 'position verkaufen', 'bestandsliste'],
+  portfolio_overview: ['depot', 'portfolio', 'übersicht depot'],
+  schedule_create: ['plan', 'kalender', 'scheduling', 'termin', 'täglich', 'taguell', 'cron', 'erinner mich', 'remind', 'um \\d+:\\d+', 'jede woche', 'jeden tag'],
+  schedule_list: ['geplante', 'scheduled jobs', 'aufträge', 'zeitplan'],
+  schedule_remove: ['plan löschen', 'job löschen', 'zeitplan entfernen', 'scheduled remove'],
+  chart_spec: ['diagramm', 'chart', 'graph', 'visualisier', 'plot'],
+  export_file: ['export', 'herunterladen', 'download', 'datei speichern', 'csv speichern', 'als datei'],
+  import_file: ['import', 'datei hochladen', 'upload', 'csv-Datei', 'meine datei'],
+};
+
+/**
+ * Returns the enabled tools relevant for `query`. Guarantees: at least the
+ * core search/fetch tools are present, and the result never exceeds
+ * MAX_SELECTED_TOOLS (extra matches are dropped in registry order). When the
+ * query matches nothing specific, only the core set is returned — cheap by
+ * design, because the model can always fall back to web search.
+ */
+export function selectRelevantTools(tools: ToolDefinition[], query: string): ToolDefinition[] {
+  const MAX_SELECTED_TOOLS = 8;
+  const q = (query || '').toLowerCase();
+  if (!q.trim()) return tools.filter(t => TOOL_CORE_IDS.includes(t.id));
+
+  const core = new Set(TOOL_CORE_IDS);
+  const matchedIds = new Set<string>();
+  for (const [toolId, keywords] of Object.entries(TOOL_KEYWORDS)) {
+    if (core.has(toolId)) continue;
+    if (keywords.some(k => q.includes(k))) matchedIds.add(toolId);
+  }
+  // Broad fallback: any question that looks open-ended ("wer/was/wo/wie…")
+  // gets the report/search family via the core set already; nothing extra.
+  const selected = tools.filter(t => core.has(t.id) || matchedIds.has(t.id));
+  if (selected.length > MAX_SELECTED_TOOLS) {
+    // Keep core tools first, then fill up with matches in registry order.
+    const cores = selected.filter(t => core.has(t.id));
+    const rest = selected.filter(t => !core.has(t.id));
+    return [...cores, ...rest].slice(0, MAX_SELECTED_TOOLS);
+  }
+  return selected;
+}
+
 // Built-in tool implementations
 class ToolRegistry {
   private tools: Map<string, ToolDefinition> = new Map();
@@ -170,14 +244,35 @@ class ToolRegistry {
     return Array.from(this.tools.values());
   }
 
-  getToolDefinitionsForLLM(): any[] {
+  /**
+   * Tool definitions sent to the model. NOTE: this catalogue is billed as
+   * PROMPT TOKENS ON EVERY REQUEST — system prompt, full message history and
+   * all previous tool results are re-sent alongside it on every step of an
+   * agent loop. With ~29 registered tools the full catalogue costs roughly
+   * 7k tokens per call (measured), which is why a trivial question like
+   * "wer ist friedrich merz?" showed ~20k tokens in the UI even though the
+   * answer itself was ~300 tokens. To keep simple questions cheap we select
+   * only the tools that are plausibly relevant for the current turn and
+   * always include a small core set (web search + url fetch) so the model
+   * can still research anything. Models inventing an unselected tool simply
+   * receive the existing "not found" error and can pick another one.
+   */
+  getToolDefinitionsForLLM(query?: string): any[] {
     // Only send inputSchema to the LLM — outputSchema is not part of the
     // OpenAI tool-call format and would only inflate prompt tokens.
-    return this.getEnabledTools().map(t => ({
+    const enabled = this.getEnabledTools();
+    const selected = query ? selectRelevantTools(enabled, query) : enabled;
+    return selected.map(t => ({
       name: t.id,
       description: t.description,
       inputSchema: t.inputSchema,
     }));
+  }
+
+  /** All enabled tool ids — used by error messages that must stay truthful
+   *  about what exists even when the current request only offered a subset. */
+  getEnabledToolIds(): string[] {
+    return this.getEnabledTools().map(t => t.id);
   }
 
   /** Map near-miss tool ids onto real tools (exact → normalized → legacy alias → unique substring). */
