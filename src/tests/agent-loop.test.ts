@@ -11,9 +11,40 @@ vi.mock('../services/database', () => ({
   saveChatSession: vi.fn().mockResolvedValue(undefined),
   addLog: vi.fn().mockResolvedValue(undefined),
 }));
+// The registry must NOT hit the network inside unit tests: swap every tool
+// implementation for a deterministic echo while keeping the REAL validation,
+// coercion and timeout logic of ToolRegistry.execute() intact.
+vi.mock('../services/tools', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/tools')>();
+  for (const def of actual.toolRegistry.getAllTools()) {
+    actual.toolRegistry.register(def, async (args: Record<string, any>) => ({
+      expression: args.expression,
+      result: evalSafe(args.expression),
+      query: args.query,
+      url: args.url,
+    }));
+  }
+  return actual;
+});
+
+/** Tiny safe evaluator for the mocked calculator (`"2+2"` → 4). */
+function evalSafe(expression: unknown): number | undefined {
+  if (typeof expression !== 'string' || !/^[\d+\-*/().\s]+$/.test(expression)) return undefined;
+  try {
+    return Function(`"use strict"; return (${expression});`)();
+  } catch {
+    return undefined;
+  }
+}
 
 import { callProvider } from '../services/provider';
-import { ChatOrchestrator } from '../services/chat';
+import {
+  ChatOrchestrator,
+  COMPACT_RESULT_MAX_STRING,
+  COMPACT_RESULT_MAX_ARRAY,
+  DEDUP_CACHED_NOTE,
+} from '../services/chat';
+import { toolRegistry, compactToolData } from '../services/tools';
 
 const mockedCall = vi.mocked(callProvider);
 
@@ -22,12 +53,12 @@ const settings: AppSettings = {
   maxToolSteps: 10,
 } as unknown as AppSettings;
 
-function makeSession(): ChatSession {
+function makeSession(query = 'Wieviel Mitarbeiter hat Lidl?'): ChatSession {
   return {
     id: 's1',
     title: 'test',
     messages: [
-      { id: 'm1', role: 'user', content: 'Wieviel Mitarbeiter hat Lidl?', timestamp: Date.now() },
+      { id: 'm1', role: 'user', content: query, timestamp: Date.now() },
     ],
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -63,6 +94,13 @@ function scriptSteps(steps: Array<{ content?: string; toolCalls?: any[] }>) {
 /** The `messages` array passed to callProvider on step n (0-based). */
 const promptAt = (n: number) => mockedCall.mock.calls[n][1] as any[];
 
+const runLoop = (session: ChatSession = makeSession(), callbacks: Record<string, any> = {}) =>
+  new ChatOrchestrator().sendMessage(settings, session, undefined, {
+    onToken: () => {}, onToolCall: () => {}, onToolResult: () => {},
+    onComplete: () => {}, onError: () => {}, onStatus: () => {},
+    ...callbacks,
+  });
+
 beforeEach(() => {
   mockedCall.mockReset();
 });
@@ -76,10 +114,7 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
       { content: 'Fertig.' },                                  // step 3: final answer
     ]);
 
-    await new ChatOrchestrator().sendMessage(settings, makeSession(), undefined, {
-      onToken: () => {}, onToolCall: () => {}, onToolResult: () => {},
-      onComplete: () => {}, onError: () => {}, onStatus: () => {},
-    });
+    await runLoop();
 
     // Step 2's prompt must contain the real calculator result…
     const step2 = promptAt(1);
@@ -105,10 +140,7 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
       { content: 'Antwort.' },
     ]);
 
-    await new ChatOrchestrator().sendMessage(settings, makeSession(), undefined, {
-      onToken: () => {}, onToolCall: () => {}, onToolResult: () => {},
-      onComplete: () => {}, onError: () => {}, onStatus: () => {},
-    });
+    await runLoop();
 
     const step2 = promptAt(1);
     // Every tool_call in the assistant message needs exactly one tool reply…
@@ -128,10 +160,7 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
     const calls = [1, 2, 3, 4, 5].map(n => sseCall(`x${n}`, 'calculator', { expression: `${n}+0` }));
     scriptSteps([{ toolCalls: calls }, { content: 'OK.' }]);
 
-    await new ChatOrchestrator().sendMessage(settings, makeSession(), undefined, {
-      onToken: () => {}, onToolCall: () => {}, onToolResult: () => {},
-      onComplete: () => {}, onError: () => {}, onStatus: () => {},
-    });
+    await runLoop();
 
     const step2 = promptAt(1);
     const assistant = step2.find((m: any) => m.role === 'assistant');
@@ -155,10 +184,7 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
     ]);
 
     const completed: any[] = [];
-    await new ChatOrchestrator().sendMessage(settings, makeSession(), undefined, {
-      onToken: () => {}, onToolCall: () => {}, onToolResult: () => {},
-      onComplete: (m: any) => completed.push(m), onError: () => {}, onStatus: () => {},
-    });
+    await runLoop(makeSession(), { onComplete: (m: any) => completed.push(m) });
 
     // Exactly two provider calls: the tool step + ONE synthesis call — not 10.
     expect(mockedCall).toHaveBeenCalledTimes(2);
@@ -171,6 +197,41 @@ describe('agent loop tool-call deduplication (token optimization)', () => {
     expect(completed).toHaveLength(1);
     expect(completed[0].content).toContain('Ich rechne.');
     expect(completed[0].content).toContain('Finale Antwort aus gesammeltem Material.');
+  });
+
+  it('replays the cached payload verbatim (single stringify, note appended)', async () => {
+    // The dedup replay must send EXACTLY the compacted payload the producer's
+    // executed result produced, plus the cache note — no second compaction
+    // pass over the same data, and never corrupted/truncated JSON.
+    const args = { expression: '3+3' };
+    scriptSteps([
+      { toolCalls: [sseCall('p1', 'calculator', args)] },
+      { toolCalls: [sseCall('p2', 'calculator', args)] },
+      { content: 'Fertig.' },
+    ]);
+
+    await runLoop();
+
+    const expectedPayload = JSON.stringify(
+      compactToolData({ expression: '3+3', result: 6 }, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY)
+    );
+    const step3 = promptAt(2);
+    const replay = step3.find((m: any) => m.role === 'tool' && m.tool_call_id === 'p2');
+    expect(replay.content).toBe(
+      `${expectedPayload.slice(0, -1)},"note":"${DEDUP_CACHED_NOTE}"}`
+    );
+    expect(() => JSON.parse(replay.content)).not.toThrow();
+  });
+
+  it('does not announce budget-skipped calls as started (onToolCall fires only for executions)', async () => {
+    const calls = [1, 2, 3, 4, 5].map(n => sseCall(`y${n}`, 'calculator', { expression: `${n}+0` }));
+    scriptSteps([{ toolCalls: calls }, { content: 'OK.' }]);
+
+    const announced: string[] = [];
+    await runLoop(makeSession(), { onToolCall: (c: any) => announced.push(c.id) });
+
+    // Budget is 4 — the fifth call must never be reported as running.
+    expect(announced).toEqual(['y1', 'y2', 'y3', 'y4']);
   });
 });
 
@@ -207,12 +268,8 @@ describe('simple fact question cheap path (token runaway fix)', () => {
     ]);
 
     const executed: string[] = [];
-    const session = makeSession();
-    session.messages[0].content = 'wer ist bundeskanzler?';
-    await new ChatOrchestrator().sendMessage(settings, session, undefined, {
-      onToken: () => {}, onToolCall: (c: any) => executed.push(c.toolId), onToolResult: () => {},
-      onComplete: () => {}, onError: () => {}, onStatus: () => {},
-    });
+    const session = makeSession('wer ist bundeskanzler?');
+    await runLoop(session, { onToolCall: (c: any) => executed.push(c.toolId) });
 
     // Only the FIRST call executed; the other two were budget-skipped.
     expect(executed).toEqual(['ddg_web_search']);
@@ -238,12 +295,8 @@ describe('simple fact question cheap path (token runaway fix)', () => {
     ]);
 
     const executed: string[] = [];
-    const session = makeSession();
-    session.messages[0].content = 'recherchiere und vergleiche die Quartalszahlen: rechne 1+0, 2+0, 3+0, 4+0 aus';
-    await new ChatOrchestrator().sendMessage(settings, session, undefined, {
-      onToken: () => {}, onToolCall: (c: any) => executed.push(c.toolId), onToolResult: () => {},
-      onComplete: () => {}, onError: () => {}, onStatus: () => {},
-    });
+    const session = makeSession('recherchiere und vergleiche die Quartalszahlen: rechne 1+0, 2+0, 3+0, 4+0 aus');
+    await runLoop(session, { onToolCall: (c: any) => executed.push(c.toolId) });
 
     expect(executed).toHaveLength(4);
   });

@@ -12,8 +12,16 @@ import { buildMemoryPrompt } from './database';
  * URL and a usable excerpt per source, which is all citations and synthesis
  * need (full text remains available via url_fetch when genuinely required).
  */
-const COMPACT_RESULT_MAX_STRING = 150;
-const COMPACT_RESULT_MAX_ARRAY = 5;
+export const COMPACT_RESULT_MAX_STRING = 150;
+export const COMPACT_RESULT_MAX_ARRAY = 5;
+
+/**
+ * Note appended to the cached payload when an identical tool call is answered
+ * from the dedup cache instead of being re-executed. Exported so tests (and
+ * any consumer that must distinguish a real result from a replay) can assert
+ * against the exact protocol string.
+ */
+export const DEDUP_CACHED_NOTE = 'identical call skipped – cached result from earlier in this turn';
 
 /**
  * Runtime tool budget for SIMPLE factual questions (observed failure: "wer ist
