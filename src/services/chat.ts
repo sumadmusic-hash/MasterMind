@@ -681,9 +681,13 @@ export class ChatOrchestrator {
       // the trim drops the producer from the queue (budget-skipped producers
       // were never executed, so their duplicates must be charged).
       const queuedCallIds = new Set<string>();
-      // Duplicate calls detected in this step; their tool messages are pushed
-      // after the parallel execution so they can replay the real result.
+      // Cross-step duplicates detected in THIS step (step-scoped view of the
+      // turn-level `pendingDedupByStep` buffer): their tool messages are
+      // pushed after the parallel execution so they can replay the cached
+      // result. Intra-step siblings never land here — their producer executes
+      // in this very step and is answered right after the execution loop.
       const deferredDedupReplies: { callId: string; signature: string }[] = [];
+      pendingDedupByStep.set(step, deferredDedupReplies);
       // Protocol ids of invalid/garbage calls. They were already charged to
       // `toolCallCount` individually when detected (so the budget trim right
       // after the prepare loop sees them); the step-end accounting must not
@@ -798,16 +802,32 @@ export class ChatOrchestrator {
         const signature = `${toolName}:${JSON.stringify(toolArgs)}`;
         const priorCallId = seenToolSignatures.get(signature);
         if (priorCallId !== undefined) {
-          deferredDedupReplies.push({ callId, signature });
-          // Charge the duplicate against the per-turn budget — but ONLY when
-          // its producing call ran in an EARLIER step. If the producer is
-          // pending in THIS very step, both calls are answered from a single
-          // execution and the whole step is charged once at the end of the
-          // loop (`usedBudget` counts executed + budget-skipped); incrementing
-          // here as well would count that pair TWICE and trip the budget after
-          // half as many real executions as configured.
-          if (!queuedCallIds.has(priorCallId)) {
-            this.toolCallCount++;
+          // Intra-step sibling: the producer is queued for execution in THIS
+          // very step. Its real result will be replayed right after the
+          // parallel execution below — no turn-level buffering needed, and no
+          // extra budget charge (the whole group counts once via `usedBudget`).
+          if (queuedCallIds.has(priorCallId)) {
+            replaySourceIds.add(callId);
+          } else {
+            // Cross-step duplicate: the producer ran in an EARLIER step, so
+            // the compacted payload is already in `dedupPayloadCache`. Buffer
+            // the reply at TURN level keyed by step: it gets promoted into
+            // `messages` at the end of this step once it is clear the
+            // duplicate's tool_call survives the budget trim (a tool response
+            // without a preceding tool_call is rejected by Groq with a 400).
+            deferredDedupReplies.push({ callId, signature });
+            // Charge the duplicate against the per-turn budget ONLY when the
+            // producer was actually EXECUTED (its compacted payload is cached)
+            // or when its announcement will be dropped by the budget trim
+            // anyway (budget already spent before this step). A duplicate of
+            // a call that is still PENDING in this step's queue shares that
+            // single execution — charging it here would trip the budget after
+            // half as many real executions as configured. The pending case is
+            // settled after the trim below (see the dedupCharge loop).
+            const producerPending = pendingCalls.some(c => c.id === priorCallId);
+            if (!producerPending || this.toolCallCount >= effectiveToolBudget) {
+              this.toolCallCount++;
+            }
           }
           continue;
         }
@@ -863,6 +883,20 @@ export class ChatOrchestrator {
         pendingCalls.length = callBudgetLeft;
       }
 
+      // Deferred budget charge for cross-step duplicates whose producer was
+      // still PENDING in this step's queue when the prepare loop saw them:
+      //  - producer executed → the duplicate shares nothing but a cache hit;
+      //    it consumed real prompt/budget slots → charge one unit now;
+      //  - producer trimmed (budget-skipped) → the duplicate's announcement
+      //    and reply are dropped from the final prompt entirely, so charging
+      //    would only trip the synthesis earlier than configured → skip.
+      for (const dup of deferredDedupReplies) {
+        const priorCallId = seenToolSignatures.get(dup.signature);
+        if (priorCallId && !budgetSkippedIds.has(priorCallId)) {
+          this.toolCallCount++;
+        }
+      }
+
       // Announce the surviving calls now that the budget trim is settled.
       for (const c of pendingCalls) callbacks.onToolCall(c);
 
@@ -907,10 +941,17 @@ export class ChatOrchestrator {
           }
 
           // Add tool result to messages (compacted: raw results would otherwise
-          // be re-sent as prompt tokens on every remaining agent step)
+          // be re-sent as prompt tokens on every remaining agent step).
+          // The compacted payload is stringified EXACTLY ONCE here and cached
+          // per signature — cross-step duplicates replay that ready-to-send
+          // body without a second compact+stringify pass over the same data.
+          const compactedPayload = JSON.stringify(
+            result.success ? compactToolData(result.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY) : { error: result.error }
+          );
+          dedupPayloadCache.set(`${toolCall.toolId}:${JSON.stringify(toolCall.arguments)}`, compactedPayload);
           stepToolMessages.push({
             role: 'tool',
-            content: JSON.stringify(result.success ? compactToolData(result.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY) : { error: result.error }),
+            content: compactedPayload,
             tool_call_id: toolCall.id,
           });
 
@@ -925,41 +966,61 @@ export class ChatOrchestrator {
         }
       }
 
-      // Deferred duplicates: the producing call ran in parallel within THIS
-      // step (or earlier), so its result is available by now — replay it
-      // instead of a bare hint. Fallback note keeps the protocol valid even if
-      // the producing call itself failed before storing a result.
-      // Lookup strategy: map the signature to the id of the call that PRODUCED
-      // the result (`seenToolSignatures`), then find THAT call's actual result
-      // by matching `ToolResult.callId === originalCall.id`. Matching on the
-      // tool NAME alone would attribute the wrong payload whenever the same
-      // tool ran twice with different arguments in one turn (e.g. calculator
-      // "1+1" followed by "2+2": a name-based lookup replays 4 for the "1+1"
-      // duplicate). The id-based chain survives id normalization inside
-      // execute(): ToolResult.callId carries the pre-allocated protocol id of
-      // the producing call.
-      for (const dup of deferredDedupReplies) {
-        const priorCallId = seenToolSignatures.get(dup.signature);
-        const priorResult = priorCallId
-          ? turnToolResults.find(r => r.callId === priorCallId)
-          : undefined;
+      // Intra-step duplicate siblings: the producing call ran in parallel
+      // within THIS step, so its compacted result is now in
+      // `dedupPayloadCache` — replay it keyed to the sibling's own protocol
+      // id (the tool-call protocol needs one reply per announced call). The
+      // payload was already stringified once at execution time; only the
+      // cache note is appended here (no second compact+stringify pass).
+      // Fallback note keeps the protocol valid even if the producing call
+      // itself failed before storing a result.
+      const stepReplayIds = [...replaySourceIds];
+      replaySourceIds.clear();
+      for (const dupCallId of stepReplayIds) {
+        const producer = resolvedToolCalls.find(({ raw, id }) => id === dupCallId);
+        let dupName = (producer?.raw.function?.name || producer?.raw.name || '').trim();
+        let dupArgs: Record<string, any> = {};
+        try {
+          const argsStr = producer?.raw.function?.arguments || producer?.raw.arguments || '{}';
+          dupArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr;
+        } catch { /* signature miss → fallback note below */ }
+        const signature = `${dupName}:${JSON.stringify(dupArgs)}`;
+        const cached = dedupPayloadCache.get(signature);
         const reply: ProviderMessage = {
           role: 'tool',
-          content: JSON.stringify(
-            priorResult
-              ? { ...(priorResult.success
-                    ? compactToolData(priorResult.data, COMPACT_RESULT_MAX_STRING, COMPACT_RESULT_MAX_ARRAY)
-                    : { error: priorResult.error }),
-                 note: 'identical call skipped – cached result from earlier in this turn' }
-              : { skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }
-          ),
-          tool_call_id: dup.callId,
+          content: cached !== undefined
+            ? `${cached.slice(0, -1)},"note":"identical call skipped – cached result from earlier in this turn"}`
+            : JSON.stringify({ skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }),
+          tool_call_id: dupCallId,
         };
         stepToolMessages.push(reply);
-        stepToolMessagesByCall.set(dup.callId, reply);
+        stepToolMessagesByCall.set(dupCallId, reply);
       }
 
-      messages.push(...stepToolMessages);
+      // PROMOTION PASS: cross-step duplicates detected during THIS step's
+      // prepare loop were only BUFFERED (see the dedup branch) — push their
+      // replays now, after the executed results of this step have been added
+      // to `dedupPayloadCache` above. The order matters for the budget math:
+      //  - budget still available → every duplicate's tool_call stays in the
+      //    conversation, so its replay must be promoted into `messages` right
+      //    away; the NEXT provider call then sees the cached value keyed to
+      //    the duplicate's own id instead of a bare "returned earlier" hint;
+      //  - budget exhausted → the final prompt is assembled as a filtered
+      //    COPY (synthMessages below) that drops both the announcement and
+      //    the reply of every non-executed call (Groq rejects a tool response
+      //    without a preceding tool_call with a 400). Promoting first is
+      //    harmless: the copy filter simply leaves those ids out.
+      pendingDedupByStep.delete(step);
+      for (const dup of deferredDedupReplies) {
+        const cached = dedupPayloadCache.get(dup.signature);
+        messages.push({
+          role: 'tool',
+          content: cached !== undefined
+            ? `${cached.slice(0, -1)},"note":"identical call skipped – cached result from earlier in this turn"}`
+            : JSON.stringify({ skipped: 'duplicate call', note: 'Identical result was returned earlier in this conversation turn.' }),
+          tool_call_id: dup.callId,
+        });
+      }
 
       // Budget exhausted: force synthesis in the NEXT provider call. Without
       // this nudge the model tends to emit yet another tool-call step that
@@ -998,6 +1059,17 @@ export class ChatOrchestrator {
         // prompt — the model answers from the executed results plus the
         // nudge below (a stray or unmatched tool message is rejected by Groq
         // with a 400).
+        //
+        // IMPORTANT: the cleanup must NOT splice into `messages` itself. The
+        // buffered cross-step dedup replays were deliberately never pushed on
+        // this path, so every announcement that lost its reply is exactly one
+        // of those duplicates — instead of deleting messages in place (which
+        // also forced this whole scan), the final/synthesis prompt is built as
+        // a filtered COPY: all history up to (and including) the assistant
+        // announcement WITHOUT the dropped tool_calls, followed by every tool
+        // reply of this step that survived (executed results + budget-skip
+        // notes), followed by the nudge. Older history already satisfies the
+        // invariant and is copied verbatim — no O(n) rescanning, no mutation.
         const retainedReplyIds = new Set<string>([
           ...pendingCalls.map(c => c.id),   // executed → real result pushed
           ...budgetSkippedIds,              // trimmed → "skipped" note pushed
@@ -1005,21 +1077,30 @@ export class ChatOrchestrator {
         assistantMsg.tool_calls = (assistantMsg.tool_calls || []).filter(
           (c: any) => retainedReplyIds.has(c.id) || invalidCallIds.has(c.id)
         );
-        // Only scan THIS step's messages (assistant message onwards): older
-        // history already satisfies the invariant and rescanning it was both
-        // wrong (it could delete legitimate tool replies of previous steps
-        // that share none of these ids but match the heuristic) and O(n).
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i] === assistantMsg) break;
-          const m = messages[i];
-          if (m.role !== 'tool' || !m.tool_call_id) continue;
-          if (retainedReplyIds.has(m.tool_call_id)) continue;
-          // Drop buffered dedup replays and garbage-call error notes…
-          if (stepToolMessagesByCall.has(m.tool_call_id) || invalidCallIds.has(m.tool_call_id)) {
-            messages.splice(i, 1);
-          }
-        }
-        messages.push({
+        // Replies of THIS step that belong in the final prompt: only executed
+        // results and budget-skip notes. Buffered dedup replays (in
+        // `stepToolMessagesByCall` but not retained) stay out; garbage-call
+        // error notes keep their (now empty-announcement) slot ONLY if the id
+        // is still announced — invalid calls were filtered above via
+        // `invalidCallIds`, so their replies must ride along too.
+        const finalStepReplies = stepToolMessages.filter(m =>
+          m.tool_call_id !== undefined &&
+          (retainedReplyIds.has(m.tool_call_id) || invalidCallIds.has(m.tool_call_id))
+        );
+        synthMessages = [
+          // Everything before this step's assistant announcement, untouched.
+          ...messages.slice(0, messages.indexOf(assistantMsg)),
+          // The (possibly trimmed) announcement itself.
+          assistantMsg,
+          // Every surviving tool reply of this step, in original call order.
+          ...finalStepReplies,
+          // Budget-skip notes live directly in `messages` (pushed at trim
+          // time), not in stepToolMessages — include the ones that survived.
+          ...messages
+            .slice(messages.indexOf(assistantMsg) + 1)
+            .filter(m => m.role === 'tool' && m.tool_call_id && budgetSkippedIds.has(m.tool_call_id)),
+        ];
+        synthMessages.push({
           role: 'user',
           content: simpleFactTurn
             ? 'Keine weiteren Tools erlaubt. Antworte JETZT kurz (1–3 Sätze) direkt auf die Nutzerfrage — ausschließlich anhand des Suchergebnisses oben, NICHT anhand deines Trainingswissens. Zitiere die Quelle als URL. Falls das Suchergebnis einen Fehler enthält, sage das in einem Satz und gib keine unbestätigte Antwort.'
@@ -1049,7 +1130,12 @@ export class ChatOrchestrator {
         try {
           const result = await callProvider(
             settings,
-            [...messages],
+            // The pre-allocated synthesis prompt (see the budgetExhausted
+            // branch above): a filtered COPY of the conversation in which
+            // every tool_call announcement matches exactly one tool reply.
+            // `messages` itself stays untouched — no splicing, and the loop
+            // BREAKS right after this call so the stale list is never reused.
+            synthMessages ?? [...messages],
             undefined, // no tools offered — the model MUST answer from collected material
             {
               onToolCall: () => {}, // tools are not offered in the synthesis call
